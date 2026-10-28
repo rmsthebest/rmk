@@ -84,6 +84,8 @@ pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
                     0
                 }
             },
+            // QMK's magic keycodes travel as User(0x80 | n).
+            Action::User(id) if id & 0x80 != 0 => (id as u16 & 0x1F) | 0x7000,
             Action::User(id) => (id as u16 & 0x1F) | 0x7E00,
             _ => {
                 warn!("Action: {:?} in vial is not supported yet", a);
@@ -210,11 +212,9 @@ pub(crate) fn from_via_keycode(via_keycode: u16) -> KeyAction {
             let index = (via_keycode & 0xFF) as u8;
             KeyAction::Morse(index)
         }
-        0x7000..=0x701F => {
-            // TODO: QMK functions, such as swap ctrl/caps, gui on, haptic, music, clicky, combo, RGB, etc
-            warn!("QMK functions {:#X} not supported", via_keycode);
-            KeyAction::No
-        }
+        // QMK's magic keycodes (swap ctrl/caps, GU_TOGG, ...) as User(0x80 | n), for the
+        // firmware to handle (`keyboard::set_action_hook`).
+        0x7000..=0x701F => KeyAction::Single(Action::User(0x80 | (via_keycode as u8 & 0x1F))),
         0x7700..=0x77FF => KeyAction::Single(Action::TriggerMacro(via_keycode as u8)),
         0x7800..=0x783F => {
             // TODO: backlight and rgb configuration

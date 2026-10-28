@@ -159,6 +159,27 @@ impl Runnable for Keyboard<'_> {
     }
 }
 
+// The firmware's hook into `process_key_action_normal`, if set.
+static ACTION_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets a function that sees every action the keyboard is about to process,
+/// with its key event and the modifiers held. It may replace the action;
+/// returning false keeps it from the keyboard (it is still published as an
+/// [`ActionEvent`]).
+pub fn set_action_hook(f: fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool) {
+    ACTION_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn action_hook() -> Option<fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool> {
+    match ACTION_HOOK.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        // Only ever stored from such a fn above.
+        f => Some(unsafe {
+            core::mem::transmute::<usize, fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool>(f)
+        }),
+    }
+}
+
 pub struct Keyboard<'a> {
     /// Keymap
     pub(crate) keymap: &'a KeyMap<'a>,
@@ -1221,12 +1242,18 @@ impl<'a> Keyboard<'a> {
         });
     }
 
-    async fn process_key_action_normal(&mut self, action: Action, event: KeyboardEvent) {
+    async fn process_key_action_normal(&mut self, mut action: Action, event: KeyboardEvent) {
+        // The firmware's hook sees the action first and may replace it or keep it
+        // from the keyboard. Its ActionEvent goes out either way.
+        let pass = action_hook().is_none_or(|f| f(&mut action, &event, self.held_modifiers()));
         publish_event_async(ActionEvent {
             action,
             keyboard_event: event,
         })
         .await;
+        if !pass {
+            return;
+        }
 
         match action {
             Action::No => {}
