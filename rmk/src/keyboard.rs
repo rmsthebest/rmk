@@ -28,7 +28,7 @@ use crate::event::{
 use crate::hid::{KeyboardReport, Report};
 use crate::keyboard::combo::Combo;
 use crate::keyboard::fork::ActiveFork;
-use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState};
+use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState, sort_held_by_key};
 use crate::keyboard::mouse::{MouseAction, MouseState};
 use crate::keyboard::oneshot::OneShotState;
 use crate::keymap::KeyMap;
@@ -708,7 +708,7 @@ impl<'a> Keyboard<'a> {
 
         if check_held_buffer {
             // First, sort by press time
-            self.held_buffer.keys.sort_unstable_by_key(|k| k.press_time);
+            sort_held_by_key(&mut self.held_buffer.keys, |k| k.press_time);
 
             // Check all unresolved held keys, calculate their decision one-by-one
             for held_key in self
