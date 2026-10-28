@@ -49,8 +49,40 @@ fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
     report_channel(transport).map(|ch| (transport, ch))
 }
 
+// The firmware's report hook, if set.
+static REPORT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets a function that sees every report before it is routed, for a
+/// transport RMK doesn't know (a board's own radio module, say). Returning
+/// true means it took the report, and no transport gets it.
+pub fn set_report_hook(f: fn(&Report) -> bool) {
+    REPORT_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn report_hook(report: &Report) -> bool {
+    match REPORT_HOOK.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        // Only ever stored from such a fn above.
+        f => {
+            let f = unsafe { core::mem::transmute::<usize, fn(&Report) -> bool>(f) };
+            f(report)
+        }
+    }
+}
+
+/// Drops the reports queued for USB and leaves an all-up report of every
+/// type, so the USB host releases every key when the firmware hands its
+/// reports to its own transport (see [`set_report_hook`]).
+#[cfg(not(feature = "_no_usb"))]
+pub fn release_usb_reports() {
+    clear_and_release_report_channel(ConnectionType::Usb);
+}
+
 /// Reports generated while no transport is selected are dropped on the floor.
 pub(crate) async fn send_hid_report(mut report: Report) {
+    if report_hook(&report) {
+        return;
+    }
     let Some((transport, ch)) = active_report_channel() else {
         return;
     };
@@ -72,6 +104,9 @@ pub(crate) async fn send_hid_report(mut report: Report) {
 /// task. A dropped report can lose or merge a stroke on the host; the next
 /// report still restates every held key because steno reports are absolute.
 pub(crate) fn try_send_hid_report(report: Report) {
+    if report_hook(&report) {
+        return;
+    }
     if let Some((_, ch)) = active_report_channel() {
         let _ = ch.try_send(report);
     }

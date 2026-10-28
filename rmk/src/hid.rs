@@ -485,6 +485,13 @@ pub trait HidReaderTrait {
     fn read_report(&mut self) -> impl Future<Output = Result<Self::ReportType, HidError>>;
 }
 
+/// Sets the host's lock LEDs (Caps Lock etc.) as a transport the firmware
+/// runs itself reported them, as an LED OUT report from RMK's own would.
+pub fn set_host_leds(led_indicator: LedIndicator) {
+    LOCK_LED_STATES.store(led_indicator.into_bits(), Ordering::Relaxed);
+    publish_event(LedIndicatorEvent::new(led_indicator));
+}
+
 /// Drain LED indicator OUT reports from `reader` and republish them as
 /// [`LedIndicatorEvent`]s whenever `kind` is the active output transport.
 pub(crate) async fn run_led_reader<R: HidReaderTrait<ReportType = LedIndicator>>(
