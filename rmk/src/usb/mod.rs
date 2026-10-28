@@ -21,7 +21,7 @@ use crate::core_traits::Runnable;
 #[cfg(feature = "steno")]
 use crate::hid::StenoReport;
 use crate::hid::{
-    CompositeReport, CompositeReportType, HidError, HidWriterTrait, KeyboardReport, MOUSE_REPORT_SIZE, Report,
+    BATTERY, CompositeReport, CompositeReportType, HidError, HidWriterTrait, KeyboardReport, MOUSE_REPORT_SIZE, Report,
     run_led_reader,
 };
 use crate::light::UsbLedReader;
@@ -81,7 +81,23 @@ pub(crate) struct UsbKeyboardWriter<'a, 'd, D: Driver<'d>> {
 impl<'d, D: Driver<'d>> UsbKeyboardWriter<'_, 'd, D> {
     pub(crate) async fn run_writer(&mut self) -> ! {
         loop {
-            let report = USB_REPORT_CHANNEL.receive().await;
+            // The battery report only while configured (it mustn't wake the
+            // host), and dropped after 20 ms if the host isn't reading the
+            // endpoint: it mustn't hold up the keys.
+            let report = match select(USB_REPORT_CHANNEL.receive(), BATTERY.wait()).await {
+                Either::First(report) => report,
+                Either::Second(battery) => {
+                    if current_usb_state() == UsbState::Configured {
+                        let write = self.write_composite(CompositeReportType::Battery, &battery);
+                        if let Ok(Err(e)) =
+                            embassy_time::with_timeout(embassy_time::Duration::from_millis(20), write).await
+                        {
+                            error!("Failed to send battery report: {:?}", e);
+                        }
+                    }
+                    continue;
+                }
+            };
 
             // EndpointError::Disabled never fires on non-OTG STM32/GD32
             // peripherals during suspend, so signal wakeup proactively when a
@@ -637,6 +653,24 @@ pub(crate) use usb_hid_state_and_config;
 pub(crate) struct UsbRequestHandler;
 
 impl RequestHandler for UsbRequestHandler {
+    /// The battery report (id 0x05); anything else stalls. Before the level
+    /// is known, 100% and not charging: a stall fails Linux's first read and
+    /// upower then ignores the battery until it restarts, while a stand-in is
+    /// replaced by the first real report.
+    fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        let ReportId::In(id) = id else { return None };
+        if id != CompositeReportType::Battery as u8 {
+            return None;
+        }
+        let report = crate::hid::battery_now().unwrap_or(crate::hid::BatteryReport {
+            level: 100,
+            charging: false,
+        });
+        let (first, rest) = buf.split_first_mut()?;
+        *first = id;
+        Some(1 + report.serialize(rest).ok()?)
+    }
+
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
         info!("Set report for {:?}: {:?}", id, data);
         OutResponse::Accepted

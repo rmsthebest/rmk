@@ -102,6 +102,8 @@ pub enum CompositeReportType {
     Mouse = 0x02,
     Media = 0x03,
     System = 0x04,
+    /// The battery ([`BatteryReport`]); USB only.
+    Battery = 0x05,
 }
 
 /// Plover HID stenography report.
@@ -265,6 +267,18 @@ impl AsInputReport for MouseReport {
                 #[item_settings(data,array,absolute,not_null)] system_usage_id=input;
             };
         };
+    },
+    // The battery (BatteryReport): Generic Device Controls' Battery Strength,
+    // 0-100%, and Battery System's Charging. Linux shows it as a power supply.
+    (collection = APPLICATION, usage_page = 0x06, usage = 0x20) = {
+        (report_id = 0x05,) = {
+            (usage = 0x20, logical_min = 0, logical_max = 100) = {
+                #[item_settings(data,variable,absolute)] battery_strength=input;
+            };
+            (usage_page = 0x85, usage = 0x44, logical_min = 0, logical_max = 1) = {
+                #[item_settings(data,variable,absolute)] charging=input;
+            };
+        };
     }
 )]
 #[derive(Default, Serialize)]
@@ -276,6 +290,62 @@ pub struct CompositeReport {
     pub(crate) pan: i16,   // Scroll left (negative) or right (positive) this many units
     pub(crate) media_usage_id: u16,
     pub(crate) system_usage_id: u8,
+    pub(crate) battery_strength: u8,
+    pub(crate) charging: u8,
+}
+
+/// The battery report (report id 0x05 of `CompositeReport`, USB only): the
+/// level, 0-100%, and whether it's charging.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BatteryReport {
+    pub level: u8,
+    pub charging: bool,
+}
+
+impl AsInputReport for BatteryReport {
+    fn serialize(&self, buffer: &mut [u8]) -> Result<usize, BufferOverflow> {
+        if buffer.len() < 2 {
+            return Err(BufferOverflow);
+        }
+        buffer[0] = self.level.min(100);
+        buffer[1] = self.charging as u8;
+        Ok(2)
+    }
+}
+
+/// The latest battery report for USB's writer, which sends it while
+/// configured and not suspended (it never wakes the host).
+pub(crate) static BATTERY: embassy_sync::signal::Signal<crate::RawMutex, BatteryReport> =
+    embassy_sync::signal::Signal::new();
+
+/// Reports the battery to the USB host. Send it when the level or charging
+/// changes, and again on each USB configuration (a report while unconfigured
+/// or suspended is dropped).
+pub fn set_battery(report: BatteryReport) {
+    BATTERY.signal(report);
+}
+
+/// The battery as it is now, for a GET_REPORT of report 0x05: bit 15 once
+/// known, bit 8 charging, bits 0-7 the level.
+static BATTERY_NOW: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Sets the battery as it is now, whether or not USB is up. The host may ask
+/// for it before the first report (Linux does as soon as it sees the
+/// battery, and if that read fails, upower ignores the battery until it
+/// restarts).
+pub fn set_battery_now(report: BatteryReport) {
+    BATTERY_NOW.store(
+        0x8000 | (report.charging as u16) << 8 | report.level as u16,
+        Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn battery_now() -> Option<BatteryReport> {
+    let v = BATTERY_NOW.load(Ordering::Relaxed);
+    (v & 0x8000 != 0).then_some(BatteryReport {
+        level: v as u8,
+        charging: v & 0x100 != 0,
+    })
 }
 
 #[cfg(test)]
