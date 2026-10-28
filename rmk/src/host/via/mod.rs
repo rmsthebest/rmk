@@ -12,6 +12,25 @@ use crate::keymap::KeyMap;
 use crate::{MACRO_MAX_NUM, MACRO_SPACE_SIZE, boot};
 
 pub(crate) mod keycode_convert;
+
+// The firmware's handler for VIA's custom value commands, if set.
+static CUSTOM_VALUE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the handler for VIA's id_custom_set_value (0x07), id_custom_get_value
+/// (0x08) and id_custom_save (0x09): backlight, RGB and the keyboard's own
+/// settings. It gets the whole 32-byte reply, pre-filled with the request
+/// (the command in byte 0), and answers in place.
+pub fn set_custom_value_hook(f: fn(&mut [u8])) {
+    CUSTOM_VALUE.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn custom_value_hook() -> Option<fn(&mut [u8])> {
+    match CUSTOM_VALUE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        // Only ever stored from a `fn(&mut [u8])` above.
+        f => Some(unsafe { core::mem::transmute::<usize, fn(&mut [u8])>(f) }),
+    }
+}
 mod vial;
 
 pub struct VialService<'a> {
@@ -125,17 +144,11 @@ impl<'a> VialService<'a> {
             ViaCommand::DynamicKeymapReset => {
                 warn!("Dynamic keymap reset -- not supported")
             }
-            ViaCommand::CustomSetValue => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom set value -- not supported")
-            }
-            ViaCommand::CustomGetValue => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom get value -- not supported")
-            }
-            ViaCommand::CustomSave => {
-                // backlight/rgblight/rgb matrix/led matrix/audio settings here
-                warn!("Custom get value -- not supported")
+            ViaCommand::CustomSetValue | ViaCommand::CustomGetValue | ViaCommand::CustomSave => {
+                match custom_value_hook() {
+                    Some(f) => f(&mut report.input_data),
+                    None => warn!("Custom value -- not supported"),
+                }
             }
             ViaCommand::EepromReset => {
                 warn!("Resetting storage..");

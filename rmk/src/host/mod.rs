@@ -17,7 +17,6 @@ pub(crate) mod storage;
 pub(crate) mod transport;
 #[cfg(feature = "vial")]
 pub(crate) mod via;
-
 /// The active host-protocol service. Resolves to [`via::VialService`]
 /// under the `vial` feature and [`rynk::RynkService`] under `rynk` (the
 /// two are mutually exclusive).
@@ -25,3 +24,5 @@ pub(crate) mod via;
 pub use rynk::RynkService as HostService;
 #[cfg(feature = "vial")]
 pub use via::VialService as HostService;
+#[cfg(feature = "vial")]
+pub use via::set_custom_value_hook;
