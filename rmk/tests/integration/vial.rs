@@ -221,6 +221,32 @@ fn macro_buffer(cmd: ViaCommand, offset: u16, payload: &[u8]) -> [u8; REPORT] {
     request
 }
 
+/// `DynamicKeymapSetBuffer` takes the same layout `GetBuffer` returns: a byte
+/// offset, a byte count, and big-endian keycodes, two bytes each. A full
+/// 28-byte packet past the end of a small keymap writes what fits.
+#[test]
+fn keymap_set_buffer_matches_get_buffer() {
+    test_block_on(async {
+        let mut keyboard = SimKeyboard::builder([[[k!(A), k!(B)]]]).build().await;
+        let mut keys = [0u8; 28];
+        keys[0..2].copy_from_slice(&to_via_keycode(k!(C)).to_be_bytes());
+        keys[2..4].copy_from_slice(&to_via_keycode(k!(D)).to_be_bytes());
+        keyboard.echo(macro_buffer(ViaCommand::DynamicKeymapSetBuffer, 0, &keys));
+        let request = macro_buffer(ViaCommand::DynamicKeymapGetBuffer, 0, &[0; 4]);
+        let reply = macro_buffer(ViaCommand::DynamicKeymapGetBuffer, 0, &keys[..4]);
+        keyboard.host_exchange(request, reply);
+        // At byte offset 2: the second key only.
+        let one = to_via_keycode(k!(E)).to_be_bytes();
+        keyboard.echo(macro_buffer(ViaCommand::DynamicKeymapSetBuffer, 2, &one));
+        let request = macro_buffer(ViaCommand::DynamicKeymapGetBuffer, 0, &[0; 4]);
+        let mut both = [0u8; 4];
+        both[0..2].copy_from_slice(&keys[0..2]);
+        both[2..4].copy_from_slice(&one);
+        keyboard.host_exchange(request, macro_buffer(ViaCommand::DynamicKeymapGetBuffer, 0, &both));
+        keyboard.run().await;
+    });
+}
+
 /// vial-gui asks the buffer size, then reads the buffer in Vial's own encoding:
 /// every macro rendered and `0x00`-terminated, an op Vial cannot spell left
 /// out, the rest zero.

@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder};
 use embassy_time::Instant;
 use embedded_io_async::{Read, Write};
 use rmk_types::protocol::vial::{VIA_FIRMWARE_VERSION, VIA_PROTOCOL_VERSION, ViaCommand, ViaKeyboardInfo};
@@ -238,21 +238,26 @@ impl<'a> VialService<'a> {
             }
             ViaCommand::DynamicKeymapSetBuffer => {
                 debug!("Dynamic keymap set buffer");
+                // As GetBuffer: offset and size are in bytes, two per
+                // keycode, big-endian.
                 let offset = BigEndian::read_u16(&report.output_data[1..3]);
                 // size <= 28
-                let size = report.output_data[3];
-                let mut idx = 4;
-                let (rows, cols, _) = self.ctx.keymap_dimensions();
-                for i in 0..(size as usize) {
-                    let via_keycode = LittleEndian::read_u16(&report.output_data[idx..idx + 2]);
+                let size = (report.output_data[3] as usize).min(report.output_data.len() - 4);
+                let (rows, cols, layers) = self.ctx.keymap_dimensions();
+                let start = (offset / 2) as usize;
+                for i in 0..size / 2 {
+                    let flat_index = start + i;
+                    if flat_index >= rows * cols * layers {
+                        break;
+                    }
+                    let idx = 4 + 2 * i;
+                    let via_keycode = BigEndian::read_u16(&report.output_data[idx..idx + 2]);
                     let action = from_via_keycode(via_keycode);
-                    let flat_index = offset as usize + i;
                     let (layer, in_layer) = (flat_index / (rows * cols), flat_index % (rows * cols));
                     let _ = self
                         .ctx
                         .set_action(layer as u8, (in_layer / cols) as u8, (in_layer % cols) as u8, action)
                         .await;
-                    idx += 2;
                 }
             }
             ViaCommand::DynamicKeymapGetEncoder => {
