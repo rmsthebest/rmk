@@ -4,6 +4,19 @@ use rmk_types::morse::MorsePattern;
 
 use crate::event::{KeyboardEvent, KeyboardEventSource};
 
+/// Sorts held keys by `key`, in place: an insertion sort. The buffer is
+/// small, and `sort_unstable_by_key` costs a 1.6 KB stack frame and about
+/// 7 KB of code per call site on Cortex-M (opt-level "z").
+pub(crate) fn sort_held_by_key<K: Ord>(keys: &mut [HeldKey], key: impl Fn(&HeldKey) -> K) {
+    for i in 1..keys.len() {
+        let mut j = i;
+        while j > 0 && key(&keys[j - 1]) > key(&keys[j]) {
+            keys.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
 /// The buffer of held keys.
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
