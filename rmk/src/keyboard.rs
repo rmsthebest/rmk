@@ -180,6 +180,9 @@ fn action_hook() -> Option<fn(&mut Action, &KeyboardEvent, ModifierCombination) 
 /// How many Repeat or Again keys can be held at once.
 const REPEATED_KEYS: usize = 4;
 
+/// How many presses the action hook's rewrites are kept for.
+const HOOKED_KEYS: usize = 16;
+
 pub struct Keyboard<'a> {
     /// Keymap
     pub(crate) keymap: &'a KeyMap<'a>,
@@ -208,6 +211,11 @@ pub struct Keyboard<'a> {
     /// The key each held Repeat or Again press repeated, so its release
     /// releases that key even if another was typed in between.
     repeated_keys: Vec<(KeyboardEventSource, HidKeyCode), REPEATED_KEYS>,
+
+    /// The action hook's result for each held press: its source, the action
+    /// the hook saw, and the one it made of it. The release ends that one,
+    /// even if the hook would rewrite it differently by then.
+    hooked_keys: Vec<(KeyboardEventSource, Action, Action), HOOKED_KEYS>,
 
     /// Oneshot Layer state
     osl_state: OneShotState<u8>,
@@ -283,6 +291,7 @@ impl<'a> Keyboard<'a> {
             system_control_report: SystemControlReport { usage_id: 0 },
             last_key_code: HidKeyCode::No,
             repeated_keys: Vec::new(),
+            hooked_keys: Vec::new(),
             combo_on: true,
             #[cfg(feature = "steno")]
             steno: crate::keyboard::steno::StenoChord::new(),
@@ -1269,7 +1278,10 @@ impl<'a> Keyboard<'a> {
     async fn process_key_action_normal(&mut self, mut action: Action, event: KeyboardEvent) {
         // The firmware's hook sees the action first and may replace it or keep it
         // from the keyboard. Its ActionEvent goes out either way.
-        let pass = action_hook().is_none_or(|f| f(&mut action, &event, self.held_modifiers()));
+        let pass = match action_hook() {
+            Some(f) => self.run_action_hook(f, &mut action, event),
+            None => true,
+        };
         publish_event_async(ActionEvent {
             action,
             keyboard_event: event,
@@ -1580,6 +1592,35 @@ impl<'a> Keyboard<'a> {
 
     /// The key a Repeat or Again `event` stands for: the last key on its press,
     /// and on its release whatever that press repeated.
+    /// Runs the action hook on `action`. A release still goes through the hook,
+    /// but ends what its press became.
+    fn run_action_hook(
+        &mut self,
+        f: fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool,
+        action: &mut Action,
+        event: KeyboardEvent,
+    ) -> bool {
+        let original = *action;
+        let pass = f(action, &event, self.held_modifiers());
+        let held = self
+            .hooked_keys
+            .iter()
+            .position(|(source, seen, _)| *source == event.source && *seen == original);
+        if event.pressed {
+            if let Some(i) = held {
+                self.hooked_keys.swap_remove(i);
+            }
+            // Full only if presses lost their releases: drop the oldest.
+            if self.hooked_keys.is_full() {
+                self.hooked_keys.remove(0);
+            }
+            let _ = self.hooked_keys.push((event.source, original, *action));
+        } else if let Some(i) = held {
+            *action = self.hooked_keys.swap_remove(i).2;
+        }
+        pass
+    }
+
     fn repeated_key(&mut self, event: KeyboardEvent) -> HidKeyCode {
         if event.pressed {
             if self.repeated_keys.push((event.source, self.last_key_code)).is_err() {

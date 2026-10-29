@@ -12,6 +12,7 @@
 
 mod simulator;
 
+mod action_hook;
 mod qmk_default_layer;
 
 #[cfg(feature = "_ble")]
