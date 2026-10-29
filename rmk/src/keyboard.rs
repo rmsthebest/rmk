@@ -755,7 +755,7 @@ impl<'a> Keyboard<'a> {
 
         if check_held_buffer {
             // First, sort by press time
-            sort_held_by_key(&mut self.held_buffer.keys, |k| k.press_time);
+            sort_held_by_key(&mut self.held_buffer.keys, |k| k.first_press_time);
 
             // Check all unresolved held keys, calculate their decision one-by-one
             for held_key in self

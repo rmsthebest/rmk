@@ -127,8 +127,12 @@ pub struct HeldKey {
     pub action: KeyAction,
     /// Current state of the held key
     pub state: KeyState,
-    /// The press time for the key
+    /// The press time for the key. A morse key between taps keeps its last
+    /// release time here, which its gap and quick-tap windows are measured from.
     pub press_time: Instant,
+    /// When the key first entered the buffer, which orders the buffer: a
+    /// morse key keeps its place however many taps follow.
+    pub first_press_time: Instant,
     /// The timeout time for the key
     pub timeout_time: Instant,
 }
@@ -146,6 +150,7 @@ impl HeldKey {
             action,
             state,
             press_time,
+            first_press_time: press_time,
             timeout_time,
         }
     }

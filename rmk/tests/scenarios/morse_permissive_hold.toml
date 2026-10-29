@@ -348,3 +348,16 @@ steps = [
   { release = [1, 1] },
 ]
 expect = [["LShift"], ["LShift", "W"], ["LShift", "W", "E"], ["LShift", "W"], ["LShift"], []]
+
+# A key pressed while a tap-dance is held and released after it, inside the
+# gap: the tap-dance was pressed first, so its tap goes out first.
+[[test]]
+name = "a_tap_dance_released_in_its_gap_keeps_its_place"
+behavior.morse.morses = [{ tap = "A", hold = "B", hold_after_tap = "C", double_tap = "D" }]
+steps = [
+  { press = [1, 2] },    # Press TD(0)
+  { press = [1, 3] },    # Press W, buffered behind it
+  { release = [1, 2] },  # Pattern "0", the gap still open
+  { release = [1, 3] },
+]
+expect = [["A"], [], ["W"], []]
