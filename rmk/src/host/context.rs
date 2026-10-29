@@ -51,17 +51,24 @@ impl<'a> KeyboardContext<'a> {
         self.layout_blob
     }
 
+    /// Write one key and persist it. A key out of range, or one that already
+    /// holds `action`, writes nothing.
     pub async fn set_action(&self, layer: u8, row: u8, col: u8, action: KeyAction) -> Result<(), ()> {
-        self.keymap
+        let changed = self
+            .keymap
             .set_action_at(KeyboardEventSource::key_pos(col, row), layer as usize, action);
         #[cfg(feature = "storage")]
-        store(StorageItem::Keymap {
-            layer,
-            row,
-            col,
-            action,
-        })
-        .await?;
+        if changed {
+            store(StorageItem::Keymap {
+                layer,
+                row,
+                col,
+                action,
+            })
+            .await?;
+        }
+        #[cfg(not(feature = "storage"))]
+        let _ = changed;
         Ok(())
     }
 

@@ -165,9 +165,19 @@ impl KeyMapInner<'_> {
         layer * self.row * self.col + row * self.col + col
     }
 
-    #[inline]
-    fn encoder_index(&self, layer: usize, id: usize) -> usize {
-        layer * self.num_encoder + id
+    /// The encoder `id` on `layer`, `None` when either is out of range.
+    fn encoder(&self, layer: usize, id: usize) -> Option<&EncoderAction> {
+        if id >= self.num_encoder || layer >= self.num_layer {
+            return None;
+        }
+        self.encoders.as_ref()?.get(layer * self.num_encoder + id)
+    }
+
+    fn encoder_mut(&mut self, layer: usize, id: usize) -> Option<&mut EncoderAction> {
+        if id >= self.num_encoder || layer >= self.num_layer {
+            return None;
+        }
+        self.encoders.as_mut()?.get_mut(layer * self.num_encoder + id)
     }
 
     #[inline]
@@ -246,19 +256,11 @@ impl KeyMapInner<'_> {
                 self.layers[self.layer_index(layer_num, row, col)]
             }
             KeyboardEventSource::RotaryEncoder(encoder_pos) => {
-                if let Some(encoders) = &self.encoders
-                    && encoder_pos.direction != Direction::None
-                {
-                    let idx = self.encoder_index(layer_num, encoder_pos.id as usize);
-                    if let Some(encoder_action) = encoders.get(idx) {
-                        return match encoder_pos.direction {
-                            Direction::Clockwise => encoder_action.clockwise,
-                            Direction::CounterClockwise => encoder_action.counter_clockwise,
-                            Direction::None => KeyAction::No,
-                        };
-                    }
+                match (self.encoder(layer_num, encoder_pos.id as usize), encoder_pos.direction) {
+                    (Some(encoder_action), Direction::Clockwise) => encoder_action.clockwise,
+                    (Some(encoder_action), Direction::CounterClockwise) => encoder_action.counter_clockwise,
+                    _ => KeyAction::No,
                 }
-                KeyAction::No
             }
             KeyboardEventSource::Touch(touch_pos) => {
                 let id = touch_pos.id as usize;
@@ -274,36 +276,36 @@ impl KeyMapInner<'_> {
         }
     }
 
-    fn set_action_at(&mut self, source: KeyboardEventSource, layer_num: usize, action: KeyAction) {
-        match source {
+    /// Returns whether the slot exists and now holds a different action.
+    fn set_action_at(&mut self, source: KeyboardEventSource, layer_num: usize, action: KeyAction) -> bool {
+        let slot = match source {
             KeyboardEventSource::Key(key_pos) => {
                 let row = key_pos.row as usize;
                 let col = key_pos.col as usize;
                 if row >= self.row || col >= self.col || layer_num >= self.num_layer {
                     warn!("Key position ({}, {}) out of range on layer {}", row, col, layer_num);
-                    return;
+                    return false;
                 }
                 let idx = self.layer_index(layer_num, row, col);
-                self.layers[idx] = action;
+                &mut self.layers[idx]
             }
             KeyboardEventSource::RotaryEncoder(encoder_pos) => {
-                let idx = self.encoder_index(layer_num, encoder_pos.id as usize);
-                if let Some(encoders) = &mut self.encoders
-                    && let Some(encoder_action) = encoders.get_mut(idx)
-                {
-                    match encoder_pos.direction {
-                        Direction::Clockwise => encoder_action.clockwise = action,
-                        Direction::CounterClockwise => encoder_action.counter_clockwise = action,
-                        Direction::None => {}
-                    }
+                match (
+                    self.encoder_mut(layer_num, encoder_pos.id as usize),
+                    encoder_pos.direction,
+                ) {
+                    (Some(encoder_action), Direction::Clockwise) => &mut encoder_action.clockwise,
+                    (Some(encoder_action), Direction::CounterClockwise) => &mut encoder_action.counter_clockwise,
+                    _ => return false,
                 }
             }
             KeyboardEventSource::Touch(_)
             | KeyboardEventSource::Combo(_)
             | KeyboardEventSource::Macro
             | KeyboardEventSource::Virtual(_)
-            | KeyboardEventSource::KeyCode(_) => {}
-        }
+            | KeyboardEventSource::KeyCode(_) => return false,
+        };
+        core::mem::replace(slot, action) != action
     }
 
     fn get_action_with_layer_cache(&mut self, event: KeyboardEvent) -> KeyAction {
@@ -585,8 +587,9 @@ impl<'a> KeyMap<'a> {
         self.inner.borrow().get_activated_layer()
     }
 
-    pub(crate) fn set_action_at(&self, source: KeyboardEventSource, layer: usize, action: KeyAction) {
-        self.inner.borrow_mut().set_action_at(source, layer, action);
+    /// Returns whether the slot exists and now holds a different action.
+    pub(crate) fn set_action_at(&self, source: KeyboardEventSource, layer: usize, action: KeyAction) -> bool {
+        self.inner.borrow_mut().set_action_at(source, layer, action)
     }
 
     pub(crate) fn activate_layer(&self, layer_num: u8) {
@@ -837,25 +840,19 @@ impl<'a> KeyMap<'a> {
     }
 
     pub(crate) fn get_encoder_action(&self, layer: usize, id: usize) -> Option<EncoderAction> {
-        let inner = self.inner.borrow();
-        inner.encoders.as_ref().and_then(|encoders| {
-            let idx = inner.encoder_index(layer, id);
-            encoders.get(idx).copied()
-        })
+        self.inner.borrow().encoder(layer, id).copied()
     }
 
+    /// Write one direction of an encoder. Returns the updated pair, or `None`
+    /// if the slot is out of range or already held `action`.
     pub(crate) fn set_encoder_clockwise(&self, layer: usize, id: usize, action: KeyAction) -> Option<EncoderAction> {
         let mut inner = self.inner.borrow_mut();
-        let idx = inner.encoder_index(layer, id);
-        if let Some(encoders) = &mut inner.encoders
-            && let Some(encoder_action) = encoders.get_mut(idx)
-        {
-            encoder_action.clockwise = action;
-            return Some(*encoder_action);
-        }
-        None
+        let slot = inner.encoder_mut(layer, id)?;
+        (core::mem::replace(&mut slot.clockwise, action) != action).then_some(*slot)
     }
 
+    /// Write one direction of an encoder. Returns the updated pair, or `None`
+    /// if the slot is out of range or already held `action`.
     pub(crate) fn set_encoder_counter_clockwise(
         &self,
         layer: usize,
@@ -863,28 +860,17 @@ impl<'a> KeyMap<'a> {
         action: KeyAction,
     ) -> Option<EncoderAction> {
         let mut inner = self.inner.borrow_mut();
-        let idx = inner.encoder_index(layer, id);
-        if let Some(encoders) = &mut inner.encoders
-            && let Some(encoder_action) = encoders.get_mut(idx)
-        {
-            encoder_action.counter_clockwise = action;
-            return Some(*encoder_action);
-        }
-        None
+        let slot = inner.encoder_mut(layer, id)?;
+        (core::mem::replace(&mut slot.counter_clockwise, action) != action).then_some(*slot)
     }
 
     /// Write both directions of an encoder under one borrow. Returns `false`
-    /// if the slot is out of range.
+    /// if the slot is out of range or already held `action`.
     pub(crate) fn set_encoder(&self, layer: usize, id: usize, action: EncoderAction) -> bool {
-        let mut inner = self.inner.borrow_mut();
-        let idx = inner.encoder_index(layer, id);
-        if let Some(encoders) = &mut inner.encoders
-            && let Some(slot) = encoders.get_mut(idx)
-        {
-            *slot = action;
-            return true;
+        match self.inner.borrow_mut().encoder_mut(layer, id) {
+            Some(slot) => core::mem::replace(slot, action) != action,
+            None => false,
         }
-        false
     }
 
     #[cfg(feature = "host_lock")]

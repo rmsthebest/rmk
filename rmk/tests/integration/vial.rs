@@ -467,6 +467,57 @@ fn the_longest_macro_vial_can_save_is_kept() {
     });
 }
 
+/// A key write saves only a key that exists and changes: one out of range
+/// leaves no record behind, and writing a key's own action again writes nothing.
+#[cfg(feature = "storage")]
+#[test]
+fn keymap_write_saves_only_a_real_change() {
+    test_block_on(async {
+        let flash = crate::simulator::Flash::new();
+        let mut keyboard = SimKeyboard::builder([[[k!(A)]]]).build_with_flash(flash.clone()).await;
+        keyboard.run().await;
+        for (pos, action, saves) in [
+            ([0, 0, 0], k!(B), true),
+            ([0, 0, 0], k!(B), false),
+            ([0, 0, 0], k!(A), true),
+            ([0, 0, 1], k!(B), false),
+            ([0, 1, 0], k!(B), false),
+            ([1, 0, 0], k!(B), false),
+        ] {
+            let before = flash.writes();
+            let mut request = via(ViaCommand::DynamicKeymapSetKeyCode);
+            request[1..4].copy_from_slice(&pos);
+            request[4..6].copy_from_slice(&to_via_keycode(action).to_be_bytes());
+            keyboard.echo(request);
+            keyboard.run().await;
+            assert_eq!(flash.writes() > before, saves, "{pos:?}");
+        }
+    });
+}
+
+/// An encoder index past the last encoder is out of range: it must not land
+/// on the next layer's encoder.
+#[test]
+fn encoder_write_past_the_last_encoder_changes_nothing() {
+    test_block_on(async {
+        let mut keyboard = SimKeyboard::builder([[[rmk::a!(Transparent)]], [[k!(A)]]])
+            .encoders([[EncoderAction::new(k!(A), k!(B))], [EncoderAction::new(k!(C), k!(D))]])
+            .build()
+            .await;
+        let mut request = vial(VialCommand::SetEncoder);
+        request[2..5].copy_from_slice(&[0, 1, 1]);
+        request[5..7].copy_from_slice(&to_via_keycode(k!(E)).to_be_bytes());
+        keyboard.echo(request);
+        let mut request = vial(VialCommand::GetEncoder);
+        request[2..4].copy_from_slice(&[1, 0]);
+        let mut reply = request;
+        reply[0..2].copy_from_slice(&to_via_keycode(k!(D)).to_be_bytes());
+        reply[2..4].copy_from_slice(&to_via_keycode(k!(C)).to_be_bytes());
+        keyboard.host_exchange(request, reply);
+        keyboard.run().await;
+    });
+}
+
 #[cfg(feature = "storage")]
 #[test]
 fn behavior_write_survives_restart() {
