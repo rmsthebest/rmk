@@ -12,6 +12,8 @@
 
 mod simulator;
 
+mod qmk_default_layer;
+
 #[cfg(feature = "_ble")]
 mod ble_profile;
 #[cfg(feature = "rynk")]

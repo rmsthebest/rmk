@@ -1328,17 +1328,22 @@ impl<'a> Keyboard<'a> {
                     self.keymap.activate_layer(layer_num);
                 }
             }
+            // On the press only: under QMK's default layer, setting it again
+            // on the release would turn off a layer held since.
             Action::DefaultLayer(layer_num) => {
-                // Set the default layer
-                self.keymap.set_default_layer(layer_num);
+                if event.pressed {
+                    self.keymap.set_default_layer(layer_num);
+                }
             }
             Action::PersistentDefaultLayer(layer_num) => {
                 // Set the default layer and persist it so it survives a reboot
-                self.keymap.set_default_layer(layer_num);
-                // Persist only if the layer was valid (set_default_layer rejects out-of-range)
-                #[cfg(feature = "storage")]
-                if event.pressed && self.keymap.get_default_layer() == layer_num {
-                    crate::storage::store_unchecked(crate::storage::StorageItem::DefaultLayer(layer_num)).await;
+                if event.pressed {
+                    self.keymap.set_default_layer(layer_num);
+                    // Persist only if the layer was valid (set_default_layer rejects out-of-range)
+                    #[cfg(feature = "storage")]
+                    if self.keymap.get_default_layer() == layer_num {
+                        crate::storage::store_unchecked(crate::storage::StorageItem::DefaultLayer(layer_num)).await;
+                    }
                 }
             }
             Action::Modifier(modifiers) => {
