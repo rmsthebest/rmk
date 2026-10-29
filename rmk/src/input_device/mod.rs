@@ -59,6 +59,11 @@ pub trait InputDevice: Runnable {
 
     /// Read the raw input event.
     /// Internal loops must yield or return, including on spurious readiness and I/O errors.
+    ///
+    /// On a struct that is also a `#[processor]`, the generated run loop drops this
+    /// future whenever a processor event arrives first (both need `&mut self`), so it
+    /// must be cancel-safe: leave the hardware as a fresh call expects at every `.await`,
+    /// e.g. no row left driven across a settle delay.
     async fn read_event(&mut self) -> Self::Event;
 }
 

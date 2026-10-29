@@ -120,6 +120,9 @@ pub fn generate_runnable(
             quote! { #proc_enum_name }
         }
     };
+    // `read_event` and `process` both take `&mut self`, so the read can't outlive
+    // one select: a processor event drops it, and `InputDevice::read_event`
+    // documents that it must be cancel-safe.
     let mut select_arms = vec![
         quote! { event = self.read_event().fuse() => #enum_name::Input(event) },
         quote! { proc_event = proc_sub.next_event().fuse() => #enum_name::Processor(proc_event) },
