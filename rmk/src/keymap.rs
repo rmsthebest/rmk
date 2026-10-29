@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_time::Duration;
 use rmk_types::action::{EncoderAction, KeyAction, TouchAction, TouchGesture};
@@ -190,6 +191,18 @@ impl KeyMapInner<'_> {
     }
 }
 
+/// QMK's default-layer rules, for firmware ported from QMK (see
+/// [`set_qmk_default_layer`]).
+static QMK_DEFAULT_LAYER: AtomicBool = AtomicBool::new(false);
+
+/// Follows QMK's default-layer rules: a key transparent down to the default
+/// layer takes layer 0's action (QMK's layer_switch_get_layer falls back to
+/// 0), and a new default layer turns the other layers off (layer_move(0) after
+/// set_single_persistent_default_layer, as QMK boards with a Win/Mac switch do).
+pub fn set_qmk_default_layer(on: bool) {
+    QMK_DEFAULT_LAYER.store(on, Ordering::Relaxed);
+}
+
 impl KeyMapInner<'_> {
     fn get_keymap_config(&self) -> (usize, usize, usize) {
         (self.row, self.col, self.num_layer)
@@ -208,6 +221,9 @@ impl KeyMapInner<'_> {
             return;
         }
         let before = self.get_activated_layer();
+        if QMK_DEFAULT_LAYER.load(Ordering::Relaxed) {
+            self.layer_state.fill(false);
+        }
         self.behavior.default_layer = layer_num;
         let after = self.get_activated_layer();
         // With no layer key held, the activated layer follows the default; a
@@ -307,6 +323,14 @@ impl KeyMapInner<'_> {
             }
             if layer_idx as u8 == self.behavior.default_layer {
                 break;
+            }
+        }
+
+        if QMK_DEFAULT_LAYER.load(Ordering::Relaxed) && self.behavior.default_layer != 0 {
+            let action = self.get_action_at(event.source, 0);
+            if action != KeyAction::Transparent {
+                self.replace_layer_cache(event.source, 0);
+                return action;
             }
         }
 
