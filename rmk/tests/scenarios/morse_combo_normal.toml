@@ -37,3 +37,20 @@ steps = [
   { release = [1, 1] },  # Release B — Normal mode resolves it only on release
 ]
 expect = [["C"], [], ["LShift"], []]
+
+# A combo key still waiting for its partner when a mod-tap's hold fires keeps
+# waiting: the partner completes the combo, and no member is left held.
+[[test]]
+name = "a_hold_leaves_a_waiting_combo_key_waiting"
+behavior.combo = { timeout = "50ms", combos = [{ actions = ["W", "E"], output = "X" }] }
+steps = [
+  { press = [1, 1] },    # Press MT(B, LShift)
+  { delay = 220 },
+  { press = [1, 3] },    # Press W, waiting for E
+  { delay = 40 },        # MT's hold fires at 250 ms
+  { press = [1, 4] },    # Press E: the combo
+  { release = [1, 3] },
+  { release = [1, 4] },
+  { release = [1, 1] },
+]
+expect = [["LShift"], ["LShift", "X"], ["LShift"], []]
