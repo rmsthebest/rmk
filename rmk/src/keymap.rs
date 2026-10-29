@@ -765,8 +765,15 @@ impl<'a> KeyMap<'a> {
         self.inner.borrow().behavior.mouse_key
     }
 
+    /// The table is padded to capacity with empty slots, whose trigger is `No`.
     pub(crate) fn forks_is_empty(&self) -> bool {
-        self.inner.borrow().behavior.fork.forks.is_empty()
+        self.inner
+            .borrow()
+            .behavior
+            .fork
+            .forks
+            .iter()
+            .all(|fork| fork.trigger == KeyAction::No)
     }
 
     pub(crate) fn morses_len(&self) -> usize {

@@ -946,8 +946,10 @@ impl<'a> Keyboard<'a> {
 
             'bind: loop {
                 for (i, fork) in forks.iter().enumerate() {
+                    // An empty slot's trigger is `No`, and it is no fork.
                     if !triggered_forks[i]
                         && fork_states[i].is_none()
+                        && fork.trigger != KeyAction::No
                         && fork.trigger == replacement
                         && (fork.layers == u32::MAX || layer_bit.is_some_and(|bit| fork.layers & bit != 0))
                     {
@@ -2191,6 +2193,18 @@ mod test {
             assert_eq!(keyboard.held_keycodes()[0], HidKeyCode::No);
         };
         block_on(main);
+    }
+
+    /// The fork table is padded with empty slots, and an empty slot is no
+    /// fork: pressing a `No` key mustn't activate one.
+    #[test]
+    fn an_empty_fork_slot_never_activates() {
+        block_on(async {
+            let mut keyboard = create_test_keyboard();
+            keyboard.process_inner(KeyboardEvent::key(2, 12, true)).await;
+            assert!(keyboard.fork_states.iter().all(Option::is_none));
+            keyboard.process_inner(KeyboardEvent::key(2, 12, false)).await;
+        });
     }
 
     #[test]
