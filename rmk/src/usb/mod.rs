@@ -1,7 +1,9 @@
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_futures::join::join5;
 use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
 #[cfg(feature = "usb_log")]
 use embassy_usb::class::cdc_acm::CdcAcmClass;
@@ -11,6 +13,7 @@ use embassy_usb::driver::{Driver, EndpointError};
 use embassy_usb::{Builder, Handler, UsbDevice};
 use rmk_types::DEVICE_INFO_STRING_MAX_LEN;
 use rmk_types::connection::{ConnectionType, UsbState};
+use rmk_types::led_indicator::LedIndicator;
 use static_cell::StaticCell;
 use usbd_hid::descriptor::AsInputReport;
 
@@ -177,6 +180,7 @@ impl<'d, D: Driver<'d>> HidWriterTrait for UsbKeyboardWriter<'_, 'd, D> {
                     .write(&buf[0..n])
                     .await
                     .map_err(HidError::UsbEndpointError)?;
+                LAST_KEYBOARD_REPORT.lock(|last| last.set(buf));
                 Ok(n)
             }
             Report::MouseReport(r) => self.write_composite(CompositeReportType::Mouse, r).await,
@@ -622,7 +626,9 @@ macro_rules! usb_hid_state_and_config {
 
         let state = paste::paste! { [<$descriptor:snake:upper _STATE>].init(::embassy_usb::class::hid::State::new()) };
         let request_handler = paste::paste! {
-            [<$descriptor:snake:upper _HANDLER>].init($crate::usb::UsbRequestHandler)
+            [<$descriptor:snake:upper _HANDLER>].init($crate::usb::UsbRequestHandler {
+                keyboard: matches!($protocol, ::embassy_usb::class::hid::HidBootProtocol::Keyboard),
+            })
         };
 
         let hid_config = ::embassy_usb::class::hid::Config {
@@ -674,14 +680,31 @@ pub(crate) use add_usb_reader_writer;
 pub(crate) use add_usb_writer;
 pub(crate) use usb_hid_state_and_config;
 
-pub(crate) struct UsbRequestHandler;
+pub(crate) struct UsbRequestHandler {
+    /// The boot keyboard interface: it answers for the keyboard report and
+    /// takes the lock LEDs.
+    pub(crate) keyboard: bool,
+}
+
+/// The last keyboard report the host was sent, for its GET_REPORT.
+static LAST_KEYBOARD_REPORT: BlockingMutex<RawMutex, Cell<[u8; 8]>> = BlockingMutex::new(Cell::new([0; 8]));
 
 impl RequestHandler for UsbRequestHandler {
-    /// The battery report (id 0x05); anything else stalls. Before the level
-    /// is known, 100% and not charging: a stall fails Linux's first read and
-    /// upower then ignores the battery until it restarts, while a stand-in is
-    /// replaced by the first real report.
+    /// The keyboard interface answers report 0 with the last keyboard report;
+    /// the composite one answers the battery report (id 0x05). Anything else
+    /// stalls. Before the level is known, 100% and not charging: a stall fails
+    /// Linux's first read and upower then ignores the battery until it
+    /// restarts, while a stand-in is replaced by the first real report.
     fn get_report(&mut self, id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        if self.keyboard {
+            if id != ReportId::In(0) {
+                return None;
+            }
+            let report = LAST_KEYBOARD_REPORT.lock(Cell::get);
+            let n = report.len().min(buf.len());
+            buf[..n].copy_from_slice(&report[..n]);
+            return Some(n);
+        }
         let ReportId::In(id) = id else { return None };
         if id != CompositeReportType::Battery as u8 {
             return None;
@@ -697,11 +720,19 @@ impl RequestHandler for UsbRequestHandler {
 
     fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
         info!("Set report for {:?}: {:?}", id, data);
+        // UEFI and some KVMs set the lock LEDs over the control pipe rather
+        // than the interrupt OUT endpoint.
+        if self.keyboard
+            && id == ReportId::Out(0)
+            && let Some(&leds) = data.first()
+        {
+            crate::hid::apply_led_report(LedIndicator::from_bits(leds), ConnectionType::Usb);
+        }
         OutResponse::Accepted
     }
 
     fn get_protocol(&self) -> HidProtocolMode {
-        if BOOT_MODE.load(Ordering::Relaxed) {
+        if self.keyboard && BOOT_MODE.load(Ordering::Relaxed) {
             HidProtocolMode::Boot
         } else {
             HidProtocolMode::Report
@@ -712,7 +743,9 @@ impl RequestHandler for UsbRequestHandler {
         // KeyboardReport is already the 8-byte boot keyboard layout, so the
         // mode only changes what GET_PROTOCOL answers and whether composite
         // reports are sent.
-        BOOT_MODE.store(protocol == HidProtocolMode::Boot, Ordering::Relaxed);
+        if self.keyboard {
+            BOOT_MODE.store(protocol == HidProtocolMode::Boot, Ordering::Relaxed);
+        }
         OutResponse::Accepted
     }
 }
@@ -824,7 +857,7 @@ mod tests {
     /// subclass the interface advertises.
     #[test]
     fn the_keyboard_switches_protocol_and_reports_it() {
-        let mut handler = UsbRequestHandler;
+        let mut handler = UsbRequestHandler { keyboard: true };
         assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
 
         assert_eq!(handler.set_protocol(HidProtocolMode::Boot), OutResponse::Accepted);
@@ -837,6 +870,38 @@ mod tests {
         handler.set_protocol(HidProtocolMode::Boot);
         UsbDeviceHandler::new().reset();
         assert_eq!(handler.get_protocol(), HidProtocolMode::Report);
+    }
+
+    /// UEFI and some KVMs send the lock LEDs as a SET_REPORT on the control
+    /// pipe: the keyboard interface takes them, the others leave them alone.
+    #[test]
+    fn a_control_pipe_led_report_sets_the_lock_leds() {
+        use embassy_usb::class::hid::ReportId;
+
+        use crate::keyboard::LOCK_LED_STATES;
+
+        set_usb_state(UsbState::Configured);
+        let leds = || LOCK_LED_STATES.load(core::sync::atomic::Ordering::Relaxed);
+        let mut other = UsbRequestHandler { keyboard: false };
+        assert_eq!(other.set_report(ReportId::Out(0), &[0x02]), OutResponse::Accepted);
+        assert_eq!(leds(), 0);
+        let mut keyboard = UsbRequestHandler { keyboard: true };
+        assert_eq!(keyboard.set_report(ReportId::Out(0), &[0x02]), OutResponse::Accepted);
+        assert_eq!(leds(), 0x02);
+    }
+
+    /// GET_REPORT on the keyboard interface answers with the keys the host
+    /// was last sent, as a boot keyboard must.
+    #[test]
+    fn get_report_answers_the_last_keyboard_report() {
+        use embassy_usb::class::hid::ReportId;
+
+        run_writer(&[key(4)], |_, _| {}, |_| core::future::pending(), 10);
+        let mut handler = UsbRequestHandler { keyboard: true };
+        let mut buf = [0xFF; 8];
+        assert_eq!(handler.get_report(ReportId::In(0), &mut buf), Some(8));
+        assert_eq!(buf, [0, 0, 4, 0, 0, 0, 0, 0]);
+        assert_eq!(handler.get_report(ReportId::In(2), &mut buf), None);
     }
 
     /// A charge-only cable / wall charger enables the device (VBUS present) but

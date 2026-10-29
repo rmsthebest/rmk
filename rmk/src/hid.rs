@@ -570,17 +570,20 @@ pub(crate) async fn run_led_reader<R: HidReaderTrait<ReportType = LedIndicator>>
 ) -> ! {
     loop {
         match reader.read_report().await {
-            Ok(led_indicator) => {
-                info!("Got led indicator");
-                if crate::state::active_transport() == Some(kind) {
-                    LOCK_LED_STATES.store(led_indicator.into_bits(), Ordering::Relaxed);
-                    publish_event(LedIndicatorEvent::new(led_indicator));
-                }
-            }
-            Err(e) => {
-                debug!("Read HID LED indicator error: {:?}", e);
-                embassy_time::Timer::after_millis(1000).await;
-            }
+            Ok(led_indicator) => apply_led_report(led_indicator, kind),
+            // A reader that can't read waits inside `read_report` for the
+            // transport to come back, so the next report isn't held up.
+            Err(e) => debug!("Read HID LED indicator error: {:?}", e),
         }
+    }
+}
+
+/// Take the lock LEDs a host on `kind` reported, if `kind` is the active
+/// output transport: from the interrupt OUT endpoint or a SET_REPORT.
+pub(crate) fn apply_led_report(led_indicator: LedIndicator, kind: ConnectionType) {
+    info!("Got led indicator");
+    if crate::state::active_transport() == Some(kind) {
+        LOCK_LED_STATES.store(led_indicator.into_bits(), Ordering::Relaxed);
+        publish_event(LedIndicatorEvent::new(led_indicator));
     }
 }
