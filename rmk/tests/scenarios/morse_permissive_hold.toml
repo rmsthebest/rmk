@@ -334,3 +334,17 @@ steps = [
   { release = [1, 1] },
 ]
 expect = [["C"], ["C", "LShift"], ["LShift"], []]
+
+# Releasing the later of two buffered keys holds the mod-tap and fires both,
+# the earlier one first, rather than leaving it in the buffer.
+[[test]]
+name = "release_of_the_second_buffered_key_fires_both"
+steps = [
+  { press = [1, 1] },    # Press MT(B, LShift)
+  { press = [1, 3] },    # Press W
+  { press = [1, 4] },    # Press E
+  { release = [1, 4] },  # Permissive hold: LShift, then W, then E
+  { release = [1, 3] },
+  { release = [1, 1] },
+]
+expect = [["LShift"], ["LShift", "W"], ["LShift", "W", "E"], ["LShift", "W"], ["LShift"], []]

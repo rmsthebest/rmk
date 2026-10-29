@@ -515,9 +515,13 @@ impl<'a> Keyboard<'a> {
     async fn fire_held_keys(
         &mut self,
         mut decision_for_current_key: KeyBehaviorDecision,
-        decisions: Vec<(KeyboardEventSource, HeldKeyDecision), 16>,
+        decisions: Vec<(KeyboardEventSource, HeldKeyDecision), HOLD_BUFFER_SIZE>,
     ) -> (bool, KeyBehaviorDecision) {
         let mut keyboard_state_updated = false;
+        // Buffered normal keys met before the buffer is known to be cleaned. A
+        // later key's release can still clean it, and these were pressed first,
+        // so they fire just before that key resolves.
+        let mut deferred: Vec<KeyboardEventSource, HOLD_BUFFER_SIZE> = Vec::new();
         // Fire buffered keys
         for (source, decision) in decisions {
             // Some decisions of held keys have been made, fire those keys
@@ -619,6 +623,9 @@ impl<'a> Keyboard<'a> {
                         }
                         debug!("Processing current key before releasing: {:?}", held_key.event);
                         if !key_action.is_morse() {
+                            for source in core::mem::take(&mut deferred) {
+                                self.fire_buffered_normal(source, keyboard_state_updated).await;
+                            }
                             match key_action {
                                 KeyAction::Single(action) => {
                                     self.process_key_action_normal(action, held_key.event).await;
@@ -656,6 +663,9 @@ impl<'a> Keyboard<'a> {
                                         && !defer_for_quick_tap
                                     {
                                         debug!("tap prediction {:?} -> {:?}", pattern, action);
+                                        for source in core::mem::take(&mut deferred) {
+                                            self.fire_buffered_normal(source, keyboard_state_updated).await;
+                                        }
                                         self.process_key_action_normal(action, held_key.event).await;
                                         held_key.state = KeyState::ProcessedButReleaseNotReportedYet(action);
                                         resolved = true;
@@ -678,27 +688,35 @@ impl<'a> Keyboard<'a> {
                 }
                 HeldKeyDecision::Normal => {
                     // Check if the normal keys in the buffer should be triggered.
-                    let trigger_normal = matches!(decision_for_current_key, KeyBehaviorDecision::CleanBuffer);
-
-                    if trigger_normal && let Some(held_key) = self.held_buffer.remove_if(|k| k.event.source == source) {
-                        debug!("Cleaning buffered normal key");
-                        let action = if keyboard_state_updated && held_key.event.source.is_physical() {
-                            self.keymap.get_action_with_layer_cache(held_key.event)
-                        } else {
-                            held_key.action
-                        };
-
-                        // Note: Morse like actions are not expected here.
-                        assert!(!action.is_morse());
-                        debug!("Tap Key {:?} now press down, action: {:?}", held_key.event, action);
-                        self.process_key_action_inner(&action, held_key.event, held_key.press_time)
-                            .await;
+                    if matches!(decision_for_current_key, KeyBehaviorDecision::CleanBuffer) {
+                        self.fire_buffered_normal(source, keyboard_state_updated).await;
+                    } else {
+                        let _ = deferred.push(source);
                     }
                 }
                 _ => (),
             }
         }
         (keyboard_state_updated, decision_for_current_key)
+    }
+
+    /// Press the buffered normal key from `source`, re-resolving its action if
+    /// the keyboard state changed since it was buffered.
+    async fn fire_buffered_normal(&mut self, source: KeyboardEventSource, keyboard_state_updated: bool) {
+        if let Some(held_key) = self.held_buffer.remove_if(|k| k.event.source == source) {
+            debug!("Cleaning buffered normal key");
+            let action = if keyboard_state_updated && held_key.event.source.is_physical() {
+                self.keymap.get_action_with_layer_cache(held_key.event)
+            } else {
+                held_key.action
+            };
+
+            // Note: Morse like actions are not expected here.
+            assert!(!action.is_morse());
+            debug!("Tap Key {:?} now press down, action: {:?}", held_key.event, action);
+            self.process_key_action_inner(&action, held_key.event, held_key.press_time)
+                .await;
+        }
     }
 
     /// Make decisions for current key and each held key.
