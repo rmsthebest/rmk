@@ -51,7 +51,8 @@ impl SimKeyboard {
 
     fn set_combo<const N: usize>(&mut self, index: u8, actions: [KeyAction; N], output: KeyAction) {
         let mut request = dynamic(VialDynamic::DynamicVialComboSet, index);
-        const MAX: usize = rmk::test_support::COMBO_MAX_LENGTH;
+        // Vial's combo entry: four keys, then the output.
+        const MAX: usize = 4;
         assert!(N <= MAX);
         for (idx, action) in actions.into_iter().enumerate() {
             let start = 4 + idx * 2;
@@ -154,6 +155,32 @@ fn combo_and_behavior_writes_change_the_chord() {
             .expect_keys([])
             .run()
             .await;
+    });
+}
+
+/// A combo or morse write that doesn't land says so in its return code, as
+/// vial-qmk's does: an index past the table, or a save that fails.
+#[cfg(feature = "storage")]
+#[test]
+fn a_dynamic_entry_write_that_fails_says_so() {
+    test_block_on(async {
+        let flash = crate::simulator::Flash::new();
+        let mut keyboard = SimKeyboard::builder([[[k!(A), k!(B)]]])
+            .build_with_flash(flash.clone())
+            .await;
+        keyboard.run().await;
+        let failed = |request: [u8; REPORT]| {
+            let mut reply = request;
+            reply[0] = 0xFF;
+            reply
+        };
+        let past = dynamic(VialDynamic::DynamicVialComboSet, 0xFE);
+        keyboard.host_exchange(past, failed(past));
+        flash.fail_writes(true);
+        let mut morse = dynamic(VialDynamic::DynamicVialMorseSet, 0);
+        morse[4..6].copy_from_slice(&to_via_keycode(k!(C)).to_le_bytes());
+        keyboard.host_exchange(morse, failed(morse));
+        keyboard.run().await;
     });
 }
 

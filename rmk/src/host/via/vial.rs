@@ -9,6 +9,12 @@ use crate::hid::ViaReport;
 use crate::host::context::KeyboardContext;
 use crate::host::via::keycode_convert::{from_via_keycode, to_via_keycode};
 
+/// A Vial combo entry is four keys and the output, whatever `COMBO_MAX_LENGTH` is.
+const VIAL_COMBO_KEYS: usize = 4;
+
+/// A dynamic entry op's return code for a failure: vial-qmk's -1.
+const VIAL_ENTRY_FAILED: u8 = 0xFF;
+
 /// Note: vial uses little endian, while via uses big endian
 pub(crate) async fn process_vial<'a>(
     report: &mut ViaReport,
@@ -58,7 +64,8 @@ pub(crate) async fn process_vial<'a>(
                 // Unlock in progress
                 report.input_data[1] = locker.is_unlocking() as u8;
                 // Unlock keys
-                for (idx, (row, col)) in vial_config.unlock_keys.iter().enumerate() {
+                // The report holds 15 after the two status bytes, as vial-qmk's does.
+                for (idx, (row, col)) in vial_config.unlock_keys.iter().take(15).enumerate() {
                     report.input_data[2 + idx * 2] = *row;
                     report.input_data[3 + idx * 2] = *col;
                 }
@@ -297,7 +304,8 @@ pub(crate) async fn process_vial<'a>(
                 }
                 VialDynamic::DynamicVialMorseSet => {
                     debug!("DynamicEntryOp - DynamicVialMorseSet");
-                    report.input_data[0] = 0; // Index 0 is the return code, 0 means success
+                    // Index 0 is the return code: 0 means success, -1 (as in vial-qmk) failure
+                    report.input_data[0] = VIAL_ENTRY_FAILED;
 
                     let morse_idx = report.output_data[3];
 
@@ -309,7 +317,7 @@ pub(crate) async fn process_vial<'a>(
                         let hold_after_tap = from_via_keycode(LittleEndian::read_u16(&report.output_data[10..12]));
                         let timeout_ms = LittleEndian::read_u16(&report.output_data[12..14]);
 
-                        let _ = ctx
+                        let saved = ctx
                             .update_morse(morse_idx, |morse: &mut Morse| {
                                 let _ = morse.put(TAP, tap.to_action());
                                 let _ = morse.put(DOUBLE_TAP, double_tap.to_action());
@@ -319,6 +327,9 @@ pub(crate) async fn process_vial<'a>(
                                 morse.profile.set_gap_timeout_ms(timeout_ms);
                             })
                             .await;
+                        if saved.is_ok() {
+                            report.input_data[0] = 0;
+                        }
                     }
                 }
                 VialDynamic::DynamicVialComboGet => {
@@ -329,7 +340,7 @@ pub(crate) async fn process_vial<'a>(
                     ctx.with_combos(|combos| {
                         if let Some(Some(combo)) = combos.get(combo_idx) {
                             // Combo components
-                            for i in 0..COMBO_MAX_LENGTH {
+                            for i in 0..VIAL_COMBO_KEYS {
                                 let kc = combo.config.actions.get(i).copied().unwrap_or(KeyAction::No);
                                 LittleEndian::write_u16(
                                     &mut report.input_data[1 + i * 2..3 + i * 2],
@@ -338,17 +349,18 @@ pub(crate) async fn process_vial<'a>(
                             }
                             // Combo output
                             LittleEndian::write_u16(
-                                &mut report.input_data[1 + COMBO_MAX_LENGTH * 2..3 + COMBO_MAX_LENGTH * 2],
+                                &mut report.input_data[1 + VIAL_COMBO_KEYS * 2..3 + VIAL_COMBO_KEYS * 2],
                                 to_via_keycode(combo.config.output),
                             );
                         } else {
-                            report.input_data[1..3 + COMBO_MAX_LENGTH * 2].fill(0);
+                            report.input_data[1..3 + VIAL_COMBO_KEYS * 2].fill(0);
                         }
                     });
                 }
                 VialDynamic::DynamicVialComboSet => {
                     debug!("DynamicEntryOp - DynamicVialComboSet");
-                    report.input_data[0] = 0; // Index 0 is the return code, 0 means success
+                    // Index 0 is the return code: 0 means success, -1 (as in vial-qmk) failure
+                    report.input_data[0] = VIAL_ENTRY_FAILED;
 
                     use rmk_types::combo::Combo as ComboConfig;
 
@@ -356,7 +368,7 @@ pub(crate) async fn process_vial<'a>(
 
                     let mut actions = heapless::Vec::<KeyAction, COMBO_MAX_LENGTH>::new();
                     let mut overflow = false;
-                    for i in 0..COMBO_MAX_LENGTH {
+                    for i in 0..VIAL_COMBO_KEYS {
                         let action =
                             from_via_keycode(LittleEndian::read_u16(&report.output_data[4 + i * 2..6 + i * 2]));
                         if !action.is_empty() && actions.push(action).is_err() {
@@ -368,14 +380,16 @@ pub(crate) async fn process_vial<'a>(
                         return;
                     }
                     let output = from_via_keycode(LittleEndian::read_u16(
-                        &report.output_data[4 + COMBO_MAX_LENGTH * 2..6 + COMBO_MAX_LENGTH * 2],
+                        &report.output_data[4 + VIAL_COMBO_KEYS * 2..6 + VIAL_COMBO_KEYS * 2],
                     ));
                     let config = ComboConfig {
                         actions,
                         output,
                         layer: None,
                     };
-                    let _ = ctx.set_combo(combo_idx, config).await;
+                    if ctx.set_combo(combo_idx, config).await == Ok(true) {
+                        report.input_data[0] = 0;
+                    }
                 }
                 VialDynamic::DynamicVialKeyOverrideGet => {
                     warn!("DynamicEntryOp - DynamicVialKeyOverrideGet -- to be implemented");
