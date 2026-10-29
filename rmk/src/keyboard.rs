@@ -180,6 +180,9 @@ fn action_hook() -> Option<fn(&mut Action, &KeyboardEvent, ModifierCombination) 
     }
 }
 
+/// How many Repeat or Again keys can be held at once.
+const REPEATED_KEYS: usize = 4;
+
 pub struct Keyboard<'a> {
     /// Keymap
     pub(crate) keymap: &'a KeyMap<'a>,
@@ -204,6 +207,10 @@ pub struct Keyboard<'a> {
     /// stores the last KeyCode executed, to be repeated if the repeat key os pressed
     /// Used in repeat-key
     last_key_code: HidKeyCode,
+
+    /// The key each held Repeat or Again press repeated, so its release
+    /// releases that key even if another was typed in between.
+    repeated_keys: Vec<(KeyboardEventSource, HidKeyCode), REPEATED_KEYS>,
 
     /// Oneshot Layer state
     osl_state: OneShotState<u8>,
@@ -278,6 +285,7 @@ impl<'a> Keyboard<'a> {
             media_report: MediaKeyboardReport { usage_id: 0 },
             system_control_report: SystemControlReport { usage_id: 0 },
             last_key_code: HidKeyCode::No,
+            repeated_keys: Vec::new(),
             combo_on: true,
             #[cfg(feature = "steno")]
             steno: crate::keyboard::steno::StenoChord::new(),
@@ -1502,7 +1510,7 @@ impl<'a> Keyboard<'a> {
             }
             SpecialKey::Repeat => {
                 debug!("Repeat last key code: {:?} , {:?}", self.last_key_code, event);
-                let key = self.last_key_code;
+                let key = self.repeated_key(event);
                 self.process_action_key(key, ModifierCombination::new(), event).await;
             }
             _ => warn!("SpecialKey variant not supported: {:?}", key),
@@ -1549,6 +1557,25 @@ impl<'a> Keyboard<'a> {
         }
     }
 
+    /// The key a Repeat or Again `event` stands for: the last key on its press,
+    /// and on its release whatever that press repeated.
+    fn repeated_key(&mut self, event: KeyboardEvent) -> HidKeyCode {
+        if event.pressed {
+            if self.repeated_keys.push((event.source, self.last_key_code)).is_err() {
+                warn!("Too many repeat keys held");
+            }
+            return self.last_key_code;
+        }
+        match self
+            .repeated_keys
+            .iter()
+            .position(|(source, _)| *source == event.source)
+        {
+            Some(i) => self.repeated_keys.swap_remove(i).1,
+            None => self.last_key_code,
+        }
+    }
+
     // Process action key
     /// Universal HID keyboard-key pipeline: `Again` resolution, last-key/caps-word
     /// bookkeeping, dispatch (a `HidKeyCode` may alias to consumer/system/mouse), and one-shot post.
@@ -1557,7 +1584,7 @@ impl<'a> Keyboard<'a> {
         // Not all platform support `Again` key, so we manually repeat it for users.
         if key == HidKeyCode::Again {
             debug!("Repeat(Again) last key code: {:?} , {:?}", self.last_key_code, event);
-            key = self.last_key_code;
+            key = self.repeated_key(event);
         }
 
         // Pre-check
@@ -1622,21 +1649,31 @@ impl<'a> Keyboard<'a> {
     }
 
     /// Process consumer control action. Consumer control keys are keys in hid consumer page, such as media keys.
+    /// The report holds one key, the last pressed: releasing one it no longer
+    /// holds changes nothing.
     async fn process_action_consumer_control(&mut self, key: ConsumerKey, event: KeyboardEvent) {
-        self.media_report.usage_id = if event.pressed { key.into() } else { 0 };
-
+        let usage_id: u16 = key.into();
+        if event.pressed {
+            self.media_report.usage_id = usage_id;
+        } else if self.media_report.usage_id == usage_id {
+            self.media_report.usage_id = 0;
+        } else {
+            return;
+        }
         self.send_media_report().await;
     }
 
     /// Process system control action. System control keys are keys in system page, such as power key.
+    /// One key at a time, as for consumer keys.
     async fn process_action_system_control(&mut self, key: SystemControlKey, event: KeyboardEvent) {
         if event.pressed {
             self.system_control_report.usage_id = key as u8;
-            self.send_system_control_report().await;
-        } else {
+        } else if self.system_control_report.usage_id == key as u8 {
             self.system_control_report.usage_id = 0;
-            self.send_system_control_report().await;
+        } else {
+            return;
         }
+        self.send_system_control_report().await;
     }
 
     /// Process mouse key action with acceleration support.
@@ -1840,14 +1877,12 @@ impl<'a> Keyboard<'a> {
     pub(crate) async fn send_system_control_report(&mut self) {
         self.send_report(Report::SystemControlReport(self.system_control_report))
             .await;
-        self.system_control_report.usage_id = 0;
         yield_now().await;
     }
 
     /// Send media report if needed
     pub(crate) async fn send_media_report(&mut self) {
         self.send_report(Report::MediaKeyboardReport(self.media_report)).await;
-        self.media_report.usage_id = 0;
         yield_now().await;
     }
 

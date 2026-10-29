@@ -6,7 +6,9 @@
 # `MO(1)` at (0,3) adds a second layer for the rollover cases below: layer 1
 # row 1 pairs a plain keycode with its `SHIFTED()` twin, row 2 is four
 # distinct keycodes as a control. Layer 0 row 1 holds two `LShift` keys for
-# the shared-modifier case and a `WM()` mouse button.
+# the shared-modifier case and a `WM()` mouse button. Layer 0 row 2 is
+# Repeat, A and a mouse button for the repeat cases, and (1,3) a second
+# consumer key, Mute.
 
 [layout]
 rows = 3
@@ -20,8 +22,8 @@ map = """
 [[keymap.layer]]
 keys = """
 AudioVolUp  SystemSleep  MouseRight  MO(1)
-LShift      LShift       WM(MouseBtn1, LCtrl)  No
-No          No           No                    No
+LShift      LShift       WM(MouseBtn1, LCtrl)  AudioMute
+Repeat      A            MouseBtn1             No
 """
 
 [[keymap.layer]]
@@ -160,3 +162,28 @@ expect = [
   ["Kc9"],
   [],
 ]
+
+# One consumer slot: releasing a key the slot no longer holds leaves the key
+# that took it reported.
+[[test]]
+name = "a_consumer_key_released_under_another_keeps_the_other"
+steps = [
+  { press = [0, 0] },
+  { press = [1, 3] },
+  { release = [0, 0] },
+  { release = [1, 3] },
+]
+expect = [{ consumer = ["AudioVolUp"] }, { consumer = ["AudioMute"] }, { consumer = [] }]
+
+# Repeat releases the key its press repeated, even after another key was typed
+# in between: a mouse button it held mustn't stay down.
+[[test]]
+name = "repeat_releases_what_it_pressed"
+steps = [
+  { tap = { pos = [2, 2], duration = 10 } },
+  { press = [2, 0] },
+  { press = [2, 1] },
+  { release = [2, 0] },
+  { release = [2, 1] },
+]
+expect = [{ mouse = { buttons = 1 } }, { mouse = {} }, { mouse = { buttons = 1 } }, ["A"], { mouse = {} }, []]
