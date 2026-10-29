@@ -429,6 +429,39 @@ fn a_save_writes_only_the_chunks_with_data() {
     });
 }
 
+/// A chunk whose save failed is saved by the next save, even one that sends
+/// the bytes RAM already holds.
+#[cfg(feature = "storage")]
+#[test]
+fn a_failed_macro_save_is_saved_by_the_next() {
+    test_block_on(async {
+        let flash = crate::simulator::Flash::new();
+        {
+            let mut keyboard = macro_keyboard().build_with_flash(flash.clone()).await;
+            keyboard.run().await;
+            // Slot 1's `hi` becomes `ho`, saved; then `yo`, whose save fails.
+            keyboard.echo(macro_buffer(ViaCommand::DynamicKeymapMacroSetBuffer, 8, b"o"));
+            keyboard.run().await;
+            flash.fail_writes(true);
+            keyboard.echo(macro_buffer(ViaCommand::DynamicKeymapMacroSetBuffer, 7, b"y"));
+            keyboard.run().await;
+            flash.fail_writes(false);
+            keyboard.echo(macro_buffer(ViaCommand::DynamicKeymapMacroSetBuffer, 7, b"y"));
+            keyboard.run().await;
+        }
+        let mut keyboard = macro_keyboard().build_with_flash(flash).await;
+        keyboard
+            .tap(0, 1, 10)
+            .expect_keys([HidKeyCode::Y])
+            .expect_keys([])
+            .expect_keys([HidKeyCode::O])
+            .expect_keys([])
+            .expect_keys([])
+            .run()
+            .await;
+    });
+}
+
 /// A reset empties every macro and writes the buffer, so a second reset has
 /// nothing left to write.
 #[cfg(feature = "storage")]

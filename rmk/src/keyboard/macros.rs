@@ -74,6 +74,9 @@ pub(crate) struct Macros<'a> {
     /// Whether flash has the macros yet. If not, the next save writes all of them.
     #[cfg(all(feature = "host", feature = "storage"))]
     stored: bool,
+    /// Chunks a failed save left out of flash, for the next save to write.
+    #[cfg(all(feature = "host", feature = "storage"))]
+    unsaved: Range<usize>,
     queue: Deque<Cursor, 4>,
 }
 
@@ -90,6 +93,8 @@ impl<'a> Macros<'a> {
             buf,
             #[cfg(all(feature = "host", feature = "storage"))]
             stored,
+            #[cfg(all(feature = "host", feature = "storage"))]
+            unsaved: 0..0,
             queue: Deque::new(),
         }
     }
@@ -243,24 +248,39 @@ pub(crate) fn encode_defaults(buf: &mut [u8], defaults: &[&[MacroOp]]) {
 /// what is in flash, so the first save writes the whole buffer.
 #[cfg(all(feature = "host", feature = "storage"))]
 pub(crate) async fn persist(keymap: &crate::keymap::KeyMap<'_>, changed: Range<usize>) -> Result<(), ()> {
-    let stored = keymap.macros(|m| m.stored);
-    // If macros have been stored in flash, persist changed range only.
-    // Otherwise persist the full macro space.
-    let chunks = if stored {
-        changed
-    } else {
+    let (stored, unsaved) = keymap.macros(|m| (m.stored, m.unsaved.clone()));
+    // If macros have been stored in flash, persist changed range only, and what
+    // a failed save left out. Otherwise persist the full macro space.
+    let chunks = if !stored {
         0..crate::MACRO_SPACE_SIZE / MACRO_CHUNK_SIZE
+    } else if unsaved.is_empty() {
+        changed
+    } else if changed.is_empty() {
+        unsaved
+    } else {
+        changed.start.min(unsaved.start)..changed.end.max(unsaved.end)
     };
-    for idx in chunks {
+    for idx in chunks.clone() {
         let bytes = keymap.macros(|m| m.buf.as_chunks::<MACRO_CHUNK_SIZE>().0[idx]);
         // A chunk missing from flash boots as zeros, so skip empty ones. But write
         // chunk 0 anyway, or clearing every macro would bring the defaults back.
         if !stored && idx > 0 && bytes == [0; MACRO_CHUNK_SIZE] {
             continue;
         }
-        crate::storage::store(crate::storage::StorageItem::MacroChunk { idx: idx as u8, bytes }).await?;
+        if crate::storage::store(crate::storage::StorageItem::MacroChunk { idx: idx as u8, bytes })
+            .await
+            .is_err()
+        {
+            // RAM already holds the change, so a save of the same bytes would
+            // find nothing to write: keep what's left for the next save.
+            keymap.macros(|m| m.unsaved = idx..chunks.end);
+            return Err(());
+        }
     }
-    keymap.macros(|m| m.stored = true);
+    keymap.macros(|m| {
+        m.stored = true;
+        m.unsaved = 0..0;
+    });
     Ok(())
 }
 
