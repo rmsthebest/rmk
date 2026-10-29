@@ -1,17 +1,18 @@
 // The firmware's own way into its bootloader, if set.
-static BOOTLOADER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static BOOTLOADER_HOOK: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<Option<fn() -> !>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
 
 /// Sets how [`jump_to_bootloader`] (VIA's bootloader jump, QK_BOOT) gets
 /// there, for a chip or bootloader RMK has no feature for.
 pub fn set_bootloader_hook(f: fn() -> !) {
-    BOOTLOADER_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+    BOOTLOADER_HOOK.lock(|hook| hook.set(Some(f)));
 }
 
 pub fn jump_to_bootloader() {
-    match BOOTLOADER_HOOK.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => {}
-        // Only ever stored from a `fn() -> !` above.
-        f => unsafe { core::mem::transmute::<usize, fn() -> !>(f)() },
+    if let Some(f) = BOOTLOADER_HOOK.lock(core::cell::Cell::get) {
+        f()
     }
 
     #[cfg(feature = "adafruit_bl")]

@@ -14,22 +14,21 @@ use crate::{MACRO_MAX_NUM, MACRO_SPACE_SIZE, boot};
 pub(crate) mod keycode_convert;
 
 // The firmware's handler for VIA's custom value commands, if set.
-static CUSTOM_VALUE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CUSTOM_VALUE: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<Option<fn(&mut [u8])>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
 
 /// Sets the handler for VIA's id_custom_set_value (0x07), id_custom_get_value
 /// (0x08) and id_custom_save (0x09): backlight, RGB and the keyboard's own
 /// settings. It gets the whole 32-byte reply, pre-filled with the request
 /// (the command in byte 0), and answers in place.
 pub fn set_custom_value_hook(f: fn(&mut [u8])) {
-    CUSTOM_VALUE.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+    CUSTOM_VALUE.lock(|hook| hook.set(Some(f)));
 }
 
 fn custom_value_hook() -> Option<fn(&mut [u8])> {
-    match CUSTOM_VALUE.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        // Only ever stored from a `fn(&mut [u8])` above.
-        f => Some(unsafe { core::mem::transmute::<usize, fn(&mut [u8])>(f) }),
-    }
+    CUSTOM_VALUE.lock(core::cell::Cell::get)
 }
 mod vial;
 

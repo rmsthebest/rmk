@@ -50,24 +50,20 @@ fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
 }
 
 // The firmware's report hook, if set.
-static REPORT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static REPORT_HOOK: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<Option<fn(&Report) -> bool>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
 
 /// Sets a function that sees every report before it is routed, for a
 /// transport RMK doesn't know (a board's own radio module, say). Returning
 /// true means it took the report, and no transport gets it.
 pub fn set_report_hook(f: fn(&Report) -> bool) {
-    REPORT_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+    REPORT_HOOK.lock(|hook| hook.set(Some(f)));
 }
 
 fn report_hook(report: &Report) -> bool {
-    match REPORT_HOOK.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => false,
-        // Only ever stored from such a fn above.
-        f => {
-            let f = unsafe { core::mem::transmute::<usize, fn(&Report) -> bool>(f) };
-            f(report)
-        }
-    }
+    REPORT_HOOK.lock(core::cell::Cell::get).is_some_and(|f| f(report))
 }
 
 /// Drops the reports queued for USB and leaves an all-up report of every

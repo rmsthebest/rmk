@@ -160,24 +160,21 @@ impl Runnable for Keyboard<'_> {
 }
 
 // The firmware's hook into `process_key_action_normal`, if set.
-static ACTION_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ACTION_HOOK: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<Option<fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
 
 /// Sets a function that sees every action the keyboard is about to process,
 /// with its key event and the modifiers held. It may replace the action;
 /// returning false keeps it from the keyboard (it is still published as an
 /// [`ActionEvent`]).
 pub fn set_action_hook(f: fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool) {
-    ACTION_HOOK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+    ACTION_HOOK.lock(|hook| hook.set(Some(f)));
 }
 
 fn action_hook() -> Option<fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool> {
-    match ACTION_HOOK.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        // Only ever stored from such a fn above.
-        f => Some(unsafe {
-            core::mem::transmute::<usize, fn(&mut Action, &KeyboardEvent, ModifierCombination) -> bool>(f)
-        }),
-    }
+    ACTION_HOOK.lock(core::cell::Cell::get)
 }
 
 /// How many Repeat or Again keys can be held at once.
