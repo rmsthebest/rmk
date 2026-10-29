@@ -3,9 +3,11 @@ use embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash;
 use rmk_types::constants::MACRO_CHUNK_SIZE;
 
 use crate::keyboard::combo::Combo;
-use crate::storage::{Storage, StorageKey, StorageValue, print_storage_error};
+use crate::storage::{READ_ATTEMPTS, SSError, Storage, StorageKey, StorageValue};
 
 impl<F: AsyncNorFlash> Storage<F> {
+    /// Load every stored layout item over `data` and `behavior`. A failure of the
+    /// flash part itself is retried; it is the last error that comes back.
     pub(crate) async fn read_layout<
         const ROW: usize,
         const COL: usize,
@@ -16,20 +18,33 @@ impl<F: AsyncNorFlash> Storage<F> {
         &mut self,
         data: &mut crate::keymap::KeymapData<ROW, COL, NUM_LAYER, NUM_ENCODER, NUM_TOUCHPAD>,
         behavior: &mut crate::config::BehaviorConfig,
-    ) -> Result<(), ()> {
+    ) -> Result<(), SSError<F::Error>> {
+        let mut result = self.read_layout_once(data, behavior).await;
+        for _ in 1..READ_ATTEMPTS {
+            if !matches!(result, Err(SSError::Storage { .. })) {
+                break;
+            }
+            result = self.read_layout_once(data, behavior).await;
+        }
+        result
+    }
+
+    async fn read_layout_once<
+        const ROW: usize,
+        const COL: usize,
+        const NUM_LAYER: usize,
+        const NUM_ENCODER: usize,
+        const NUM_TOUCHPAD: usize,
+    >(
+        &mut self,
+        data: &mut crate::keymap::KeymapData<ROW, COL, NUM_LAYER, NUM_ENCODER, NUM_TOUCHPAD>,
+        behavior: &mut crate::config::BehaviorConfig,
+    ) -> Result<(), SSError<F::Error>> {
         // Use fetch_all_items to speed up the keymap reading
-        let mut key_iterator = self
-            .flash
-            .fetch_all_items(&mut self.buffer)
-            .await
-            .map_err(|e| print_storage_error::<F>(e))?;
+        let mut key_iterator = self.flash.fetch_all_items(&mut self.buffer).await?;
 
         // Read all keymap keys and encoder configs
-        while let Some((key, value)) = key_iterator
-            .next::<StorageValue>(&mut self.buffer)
-            .await
-            .map_err(|e| print_storage_error::<F>(e))?
-        {
+        while let Some((key, value)) = key_iterator.next::<StorageValue>(&mut self.buffer).await? {
             match (key, value) {
                 (StorageKey::Keymap { layer, row, col }, StorageValue::KeyAction(action)) => {
                     let layer = layer as usize;
@@ -47,7 +62,11 @@ impl<F: AsyncNorFlash> Storage<F> {
                     }
                 }
                 // Restore the default (base) layer set via a `PDF` key
-                (StorageKey::DefaultLayer, StorageValue::DefaultLayer(layer)) => behavior.default_layer = layer,
+                (StorageKey::DefaultLayer, StorageValue::DefaultLayer(layer)) => {
+                    if (layer as usize) < NUM_LAYER {
+                        behavior.default_layer = layer;
+                    }
+                }
                 // Restore the VIA/Vial layout options selection
                 (StorageKey::LayoutOption, StorageValue::LayoutOption(option)) => data.layout_option = option,
                 (StorageKey::MacroChunk(idx), StorageValue::MacroChunk(bytes)) => {

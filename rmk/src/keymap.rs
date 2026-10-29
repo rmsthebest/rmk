@@ -527,10 +527,21 @@ impl<'a> KeyMap<'a> {
             if storage.clear_layout {
                 debug!("`clear_layout` is set, rewriting the items the compiled-in layout owns.");
                 storage.write_layout(data, behavior).await;
-            } else if storage.read_layout(data, behavior).await.is_err() {
-                error!("Failed to read from storage, clearing...");
-                storage.flash.erase_all().await.ok();
-                reboot_keyboard();
+            } else {
+                match storage.read_layout(data, behavior).await {
+                    Ok(()) => {}
+                    // The part itself keeps failing: keep what it holds rather than erase it.
+                    Err(e @ crate::storage::SSError::Storage { .. }) => {
+                        crate::storage::print_storage_error::<F>(e);
+                        error!("Flash keeps failing, the stored layout may be partly loaded");
+                    }
+                    Err(e) => {
+                        crate::storage::print_storage_error::<F>(e);
+                        error!("Failed to read from storage, clearing...");
+                        storage.flash.erase_all().await.ok();
+                        reboot_keyboard();
+                    }
+                }
             }
         }
 

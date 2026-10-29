@@ -9,7 +9,7 @@ use embedded_storage::nor_flash::NorFlash;
 use embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash;
 use rmk_types::connection::ConnectionType;
 use rmk_types::morse::MorseProfile;
-use sequential_storage::Error as SSError;
+pub(crate) use sequential_storage::Error as SSError;
 use sequential_storage::cache::Cache;
 use sequential_storage::cache::key_pointers::ArrayKeyPointers;
 use sequential_storage::cache::page_pointers::ArrayPagePointers;
@@ -379,6 +379,18 @@ pub struct Storage<F: AsyncNorFlash> {
 }
 
 impl<F: AsyncNorFlash> Storage<F> {
+    /// Fetch `key`, retrying a failure of the flash part itself.
+    async fn fetch_retrying(&mut self, key: StorageKey) -> Result<Option<StorageValue>, SSError<F::Error>> {
+        let mut result = self.flash.fetch_item(&mut self.buffer, &key).await;
+        for _ in 1..READ_ATTEMPTS {
+            if !matches!(result, Err(SSError::Storage { .. })) {
+                break;
+            }
+            result = self.flash.fetch_item(&mut self.buffer, &key).await;
+        }
+        result
+    }
+
     pub(crate) async fn fetch(&mut self, key: StorageKey) -> Result<Option<StorageValue>, ()> {
         self.flash
             .fetch_item(&mut self.buffer, &key)
@@ -445,10 +457,23 @@ impl<F: AsyncNorFlash> Storage<F> {
             clear_layout: false,
         };
 
-        let stored = storage.fetch(StorageKey::StorageConfig).await;
-        if storage_config.clear_storage
-            || !matches!(stored, Ok(Some(StorageValue::StorageConfig(schema_hash))) if schema_hash == SCHEMA_HASH)
-        {
+        let erase = match storage.fetch_retrying(StorageKey::StorageConfig).await {
+            Ok(Some(StorageValue::StorageConfig(schema_hash))) => schema_hash != SCHEMA_HASH,
+            // A blank flash, or another firmware's.
+            Ok(_) => true,
+            // The part itself keeps failing, so what it holds is unknown: an erase could
+            // lose a good keymap to a bad bus. Boot without it and try again next time.
+            Err(e @ SSError::Storage { .. }) => {
+                print_storage_error::<F>(e);
+                false
+            }
+            // Data that doesn't read back even after sequential-storage's own repair.
+            Err(e) => {
+                print_storage_error::<F>(e);
+                true
+            }
+        };
+        if storage_config.clear_storage || erase {
             debug!("Clearing storage!");
             // An erase never invalidates the cache the probing `fetch` filled, so rebuild the map
             // with a fresh one. Nothing else is written back: reads now miss and the RAM defaults stand.
@@ -590,6 +615,10 @@ pub(crate) fn print_storage_error<F: AsyncNorFlash>(e: SSError<F::Error>) {
     }
 }
 
+/// How many times a read is tried when the flash part itself fails it: one bad
+/// transfer must not pass for a blank storage and get erased.
+pub(crate) const READ_ATTEMPTS: usize = 3;
+
 /// Holds any one item with its key and framing; a multiple of 32 because
 /// `sequential-storage` wants that alignment on some flashes.
 const BUFFER_SIZE: usize = 256;
@@ -726,8 +755,13 @@ mod tests {
 
     /// A flash holding `items`, written by an uncached map so `Storage::new` boots over them.
     async fn seeded(items: &[(StorageKey, StorageValue)]) -> TestFlash {
+        seeded_on(Part::new(), items).await
+    }
+
+    /// [`seeded`] over `part`, so a test can keep a handle on the part.
+    async fn seeded_on(part: Part, items: &[(StorageKey, StorageValue)]) -> TestFlash {
         let mut map = MapStorage::<StorageKey, _, _>::new(
-            async_flash_wrapper(Part::new()),
+            async_flash_wrapper(part),
             MapConfig::new(STORAGE_RANGE),
             Cache::new_uncached(),
         );
@@ -864,6 +898,62 @@ mod tests {
             .await;
             let mut storage = new_storage(flash).await;
             assert!(matches!(storage.fetch(StorageKey::ConnectionType).await, Ok(None)));
+        });
+    }
+
+    /// A read the flash part fails is not a blank storage: a glitch is retried,
+    /// and a part that keeps failing is left as it is rather than erased.
+    #[test]
+    fn a_failing_read_does_not_erase() {
+        block_on(async {
+            let part = Part::new();
+            let items = [
+                (StorageKey::StorageConfig, StorageValue::StorageConfig(SCHEMA_HASH)),
+                (StorageKey::DefaultLayer, StorageValue::DefaultLayer(1)),
+            ];
+            let flash = seeded_on(part.clone(), &items).await;
+            part.fail_next_reads(1);
+            let mut storage = new_storage(flash).await;
+            assert!(matches!(
+                storage.fetch(StorageKey::DefaultLayer).await,
+                Ok(Some(StorageValue::DefaultLayer(1)))
+            ));
+
+            let (flash, _) = storage.flash.destroy();
+            part.fail_next_reads(usize::MAX);
+            let storage = new_storage(flash).await;
+            part.fail_next_reads(0);
+            let (flash, _) = storage.flash.destroy();
+            let mut storage = new_storage(flash).await;
+            assert!(matches!(
+                storage.fetch(StorageKey::DefaultLayer).await,
+                Ok(Some(StorageValue::DefaultLayer(1)))
+            ));
+        });
+    }
+
+    /// A stored default layer past this firmware's layers is ignored, or no key
+    /// would resolve on the base layer.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_stored_default_layer_out_of_range_is_ignored() {
+        use rmk_types::action::{Action, KeyAction};
+        use rmk_types::keycode::{HidKeyCode, KeyCode};
+
+        use crate::keymap::KeymapData;
+
+        block_on(async {
+            let flash = seeded(&[
+                (StorageKey::StorageConfig, StorageValue::StorageConfig(SCHEMA_HASH)),
+                (StorageKey::DefaultLayer, StorageValue::DefaultLayer(4)),
+            ])
+            .await;
+            let mut storage = new_storage(flash).await;
+            let a = KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::A)));
+            let mut data = KeymapData::new([[[a]], [[a]]]);
+            let mut behavior = RuntimeBehaviorConfig::default();
+            storage.read_layout(&mut data, &mut behavior).await.unwrap();
+            assert_eq!(behavior.default_layer, 0);
         });
     }
 

@@ -127,6 +127,7 @@ pub async fn drain_ble_profile_channel(sink: &mut std::vec::Vec<std::string::Str
 pub struct InMemoryFlash<const SIZE: usize, const ERASE: usize, const WRITE: usize> {
     data: std::rc::Rc<core::cell::RefCell<[u8; SIZE]>>,
     fail_writes: std::rc::Rc<core::cell::Cell<bool>>,
+    fail_reads: std::rc::Rc<core::cell::Cell<usize>>,
     writes: std::rc::Rc<core::cell::Cell<usize>>,
 }
 
@@ -136,6 +137,7 @@ impl<const SIZE: usize, const ERASE: usize, const WRITE: usize> InMemoryFlash<SI
         Self {
             data: std::rc::Rc::new(core::cell::RefCell::new([0xFF; SIZE])),
             fail_writes: std::rc::Rc::new(core::cell::Cell::new(false)),
+            fail_reads: std::rc::Rc::new(core::cell::Cell::new(0)),
             writes: std::rc::Rc::new(core::cell::Cell::new(0)),
         }
     }
@@ -149,6 +151,12 @@ impl<const SIZE: usize, const ERASE: usize, const WRITE: usize> InMemoryFlash<SI
     /// flash that stops taking data.
     pub fn fail_writes(&self, fail: bool) {
         self.fail_writes.set(fail);
+    }
+
+    /// Fail the next `count` reads, shared by every clone — the stand-in for a
+    /// bus that glitches.
+    pub fn fail_next_reads(&self, count: usize) {
+        self.fail_reads.set(count);
     }
 }
 
@@ -174,6 +182,10 @@ impl<const SIZE: usize, const ERASE: usize, const WRITE: usize> embedded_storage
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         embedded_storage::nor_flash::check_read(self, offset, bytes.len())?;
+        if self.fail_reads.get() > 0 {
+            self.fail_reads.set(self.fail_reads.get() - 1);
+            return Err(embedded_storage::nor_flash::NorFlashErrorKind::Other);
+        }
         let offset = offset as usize;
         bytes.copy_from_slice(&self.data.borrow()[offset..offset + bytes.len()]);
         Ok(())
