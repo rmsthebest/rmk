@@ -58,9 +58,18 @@ pub(crate) fn expand_encoder_device(
                 let resolution = match encoder.resolution.clone().expect(
                     "`resolution` field needs to be set when the encoder's mode is 'resolution'",
                 ) {
-                    EncoderResolution::Value(r) => r,
-                    EncoderResolution::Derived { detent, pulse } => pulse * 4 / detent,
+                    EncoderResolution::Value(r) => r as u16,
+                    EncoderResolution::Derived { detent, pulse } => {
+                        assert!(detent > 0, "encoder `detent` must be at least 1");
+                        pulse as u16 * 4 / detent as u16
+                    }
                 };
+                // The pulse count is an `i8`, and 0 would never step.
+                assert!(
+                    (1..=127).contains(&resolution),
+                    "encoder resolution must be 1 to 127, got {resolution}"
+                );
+                let resolution = resolution as u8;
                 let reverse = encoder.reverse.unwrap_or(false);
 
                 quote! {

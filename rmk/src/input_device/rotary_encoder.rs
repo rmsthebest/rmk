@@ -93,6 +93,8 @@ pub struct ResolutionPhase {
 }
 
 impl ResolutionPhase {
+    /// Pulses per step, from 1 to 127: the count is an `i8`, and 0 would never
+    /// fire (and divide by zero).
     pub fn new(resolution: u8, reverse: bool) -> Self {
         // Each entry corresponds to a state transition and provides +1, -1, or 0 pulse
         let mut lut = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
@@ -100,30 +102,24 @@ impl ResolutionPhase {
             lut = lut.map(|x| -x);
         }
         Self {
-            resolution,
+            resolution: resolution.clamp(1, i8::MAX as u8),
             lut,
             current_pulses: 0,
         }
     }
 
+    /// Resolution `pulse * 4 / detent`, kept in range as [`Self::new`] keeps it.
     pub fn new_with_detent_and_pulse(detent: u8, pulse: u8, reverse: bool) -> Self {
         // Each entry corresponds to a state transition and provides +1, -1, or 0 pulse
-        let mut lut = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
-        if reverse {
-            lut = lut.map(|x| -x);
-        }
-        Self {
-            resolution: pulse * 4 / detent,
-            lut,
-            current_pulses: 0,
-        }
+        let resolution = (pulse as u16 * 4 / detent.max(1) as u16).min(i8::MAX as u16) as u8;
+        Self::new(resolution, reverse)
     }
 }
 
 impl Phase for ResolutionPhase {
     fn direction(&mut self, s: u8) -> Direction {
-        // Only proceed if there was a state change
-        if (s & 0xC) != (s & 0x3) {
+        // Only proceed if there was a state change: `s` is the old state, then the new
+        if (s >> 2) != (s & 0x3) {
             // Add pulse value from the lookup table
             self.current_pulses += self.lut[s as usize & 0xF];
             // Check if we've reached the resolution threshold
@@ -349,6 +345,16 @@ mod test {
 
         // Check with default phase
         let mut default_phase = DefaultPhase {};
+        let mut zero = ResolutionPhase::new(0, false);
+        let mut derived_zero = ResolutionPhase::new_with_detent_and_pulse(0, 0, false);
+        for item in 0u8..16 {
+            assert_eq!(default_phase.direction(item), zero.direction(item));
+            assert_eq!(default_phase.direction(item), derived_zero.direction(item));
+        }
+        // 64 pulses over 1 detent is 256: one step per 127 pulses rather than a
+        // negative threshold that fires on every edge.
+        let mut coarse = ResolutionPhase::new_with_detent_and_pulse(1, 64, false);
+        assert_eq!(coarse.direction(0b0001), Direction::None);
         let mut resolution_phase = ResolutionPhase::new(1, false);
         for item in 0u8..16 {
             let d = default_phase.direction(item);
