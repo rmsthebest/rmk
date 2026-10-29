@@ -2,6 +2,9 @@ use rmk_types::action::{Action, KeyAction, KeyboardAction};
 use rmk_types::keycode::{HidKeyCode, KeyCode, SpecialKey};
 use rmk_types::modifier::ModifierCombination;
 
+/// QMK's last magic keycode, QK_MAGIC_TOGGLE_ESCAPE_CAPS_LOCK (0x7022), less 0x7000.
+const QK_MAGIC_LAST: u8 = 0x22;
+
 pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
     match key_action {
         KeyAction::No => 0x0000,
@@ -85,8 +88,8 @@ pub(crate) fn to_via_keycode(key_action: KeyAction) -> u16 {
                 }
             },
             // QMK's magic keycodes travel as User(0x80 | n).
-            Action::User(id) if id & 0x80 != 0 => (id as u16 & 0x1F) | 0x7000,
-            Action::User(id) => (id as u16 & 0x1F) | 0x7E00,
+            Action::User(id) if (0x80..=0x80 | QK_MAGIC_LAST).contains(&id) => (id & 0x7F) as u16 | 0x7000,
+            Action::User(id) if id < 0x20 => id as u16 | 0x7E00,
             _ => {
                 warn!("Action: {:?} in vial is not supported yet", a);
                 0
@@ -214,7 +217,7 @@ pub(crate) fn from_via_keycode(via_keycode: u16) -> KeyAction {
         }
         // QMK's magic keycodes (swap ctrl/caps, GU_TOGG, ...) as User(0x80 | n), for the
         // firmware to handle (`keyboard::set_action_hook`).
-        0x7000..=0x701F => KeyAction::Single(Action::User(0x80 | (via_keycode as u8 & 0x1F))),
+        0x7000..=0x7022 => KeyAction::Single(Action::User(0x80 | (via_keycode as u8 & 0x7F))),
         0x7700..=0x77FF => KeyAction::Single(Action::TriggerMacro(via_keycode as u8)),
         0x7800..=0x783F => {
             // TODO: backlight and rgb configuration
@@ -292,6 +295,24 @@ mod test {
     use rmk_types::keycode::HidKeyCode;
 
     use super::*;
+
+    /// QMK's magic keycodes run to 0x7022 (QK_MAGIC_TOGGLE_ESCAPE_CAPS_LOCK) and
+    /// round-trip through User(0x80 | n); a user id past either range has no
+    /// keycode rather than another key's.
+    #[test]
+    fn magic_keycodes_round_trip_to_the_last() {
+        for via_keycode in [0x7000, 0x700B, 0x701F, 0x7020, 0x7022] {
+            let action = from_via_keycode(via_keycode);
+            assert_eq!(
+                KeyAction::Single(Action::User(0x80 | (via_keycode & 0xFF) as u8)),
+                action
+            );
+            assert_eq!(via_keycode, to_via_keycode(action));
+        }
+        assert_eq!(KeyAction::No, from_via_keycode(0x7023));
+        assert_eq!(0, to_via_keycode(KeyAction::Single(Action::User(0x80 | 0x23))));
+        assert_eq!(0, to_via_keycode(KeyAction::Single(Action::User(0x20))));
+    }
 
     #[test]
     fn test_convert_via_keycode_to_key_action() {
