@@ -247,6 +247,22 @@ fn keymap_set_buffer_matches_get_buffer() {
     });
 }
 
+/// `DynamicKeymapGetBuffer` fills at most the 28 bytes a report holds, however
+/// many the host asks for.
+#[test]
+fn keymap_get_buffer_caps_the_size() {
+    test_block_on(async {
+        let mut keyboard = SimKeyboard::builder([[[k!(A), k!(B)]]]).build().await;
+        let mut request = via(ViaCommand::DynamicKeymapGetBuffer);
+        request[3] = 0xFE;
+        let mut reply = request;
+        reply[4..6].copy_from_slice(&to_via_keycode(k!(A)).to_be_bytes());
+        reply[6..8].copy_from_slice(&to_via_keycode(k!(B)).to_be_bytes());
+        keyboard.host_exchange(request, reply);
+        keyboard.run().await;
+    });
+}
+
 /// vial-gui asks the buffer size, then reads the buffer in Vial's own encoding:
 /// every macro rendered and `0x00`-terminated, an op Vial cannot spell left
 /// out, the rest zero.

@@ -223,8 +223,8 @@ impl<'a> VialService<'a> {
             }
             ViaCommand::DynamicKeymapGetBuffer => {
                 let offset = BigEndian::read_u16(&report.output_data[1..3]);
-                // size <= 28
-                let size = report.output_data[3];
+                // At most the 28 bytes a report holds after its header.
+                let size = report.output_data[3].min(28);
                 debug!("Getting keymap buffer, offset: {}, size: {}", offset, size);
                 let mut idx = 4;
                 let start = (offset / 2) as usize;
