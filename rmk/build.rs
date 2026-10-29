@@ -8,7 +8,8 @@ fn main() {
     common::set_target_cfgs(&mut cfgs);
 
     // `RMK_COMMIT` and `RMK_FEATURES` go into the storage schema hash.
-    // When either changes, the storage is erased.
+    // When either changes, the storage is erased. The stored values are
+    // postcard-encoded `rmk-types` enums, so a commit there counts too.
     // A build from a fork or a submodule can pin `RMK_COMMIT` in its environment,
     // so a fork commit that doesn't change the storage format keeps the storage.
     // The rerun directive only when pinned: any directive turns off the default rerun
@@ -19,7 +20,7 @@ fn main() {
             commit
         }
         Err(_) => Command::new("git")
-            .args(["log", "-1", "--format=%H", "--", "."])
+            .args(["log", "-1", "--format=%H", "--", ".", "../rmk-types"])
             .output()
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .unwrap_or_default(),
