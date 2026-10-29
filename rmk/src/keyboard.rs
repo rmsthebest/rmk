@@ -633,10 +633,9 @@ impl<'a> Keyboard<'a> {
                                 KeyAction::Tap(action) => {
                                     self.process_key_action_tap(action, held_key.event).await;
                                 }
-                                KeyAction::No => {
-                                    self.process_key_action_tap(key_action.to_action(), held_key.event)
-                                        .await;
-                                }
+                                // A combo's output is stored as given, so it can be
+                                // transparent: like `No`, there is nothing to send.
+                                KeyAction::No | KeyAction::Transparent => {}
                                 _ => unreachable!(),
                             }
                             resolved = true;
