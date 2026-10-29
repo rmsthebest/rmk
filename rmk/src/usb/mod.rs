@@ -110,17 +110,32 @@ impl<'d, D: Driver<'d>> UsbKeyboardWriter<'_, 'd, D> {
             if let Err(e) = self.write_report(&report).await {
                 error!("Failed to send report: {:?}", e);
 
-                // Belt-and-braces for OTG peripherals where Disabled is the
-                // correct suspend indicator: signal wakeup, give the host a
-                // moment, then retry the same report once.
+                // OTG peripherals disable the endpoints in suspend, so there
+                // Disabled asks for a wakeup. Otherwise a bus reset disabled
+                // them until the host configures the device again. Either way
+                // the report goes once the endpoint is back.
                 if let HidError::UsbEndpointError(EndpointError::Disabled) = e {
-                    USB_REMOTE_WAKEUP.signal(());
-                    embassy_time::Timer::after_millis(500).await;
+                    if current_usb_state() == UsbState::Suspended {
+                        USB_REMOTE_WAKEUP.signal(());
+                    }
+                    self.wait_enabled(&report).await;
                     if let Err(e) = self.write_report(&report).await {
                         error!("Failed to send report after wakeup: {:?}", e);
                     }
                 }
             }
+        }
+    }
+
+    /// Wait for the endpoint `report` goes out on to be enabled.
+    async fn wait_enabled(&mut self, report: &Report) {
+        match report {
+            Report::KeyboardReport(_) => self.keyboard_writer.ready().await,
+            Report::MouseReport(_) | Report::MediaKeyboardReport(_) | Report::SystemControlReport(_) => {
+                self.other_writer.ready().await
+            }
+            #[cfg(feature = "steno")]
+            Report::StenoReport(_) => self.steno_writer.ready().await,
         }
     }
 
@@ -139,10 +154,11 @@ impl<'d, D: Driver<'d>> UsbKeyboardWriter<'_, 'd, D> {
         if BOOT_MODE.load(Ordering::Relaxed) {
             return Ok(n);
         }
-        self.other_writer
-            .write(&buf[0..n + 1])
-            .await
-            .map_err(HidError::UsbEndpointError)?;
+        match embassy_time::with_timeout(COMPOSITE_WRITE_TIMEOUT, self.other_writer.write(&buf[0..n + 1])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(HidError::UsbEndpointError(e)),
+            Err(_) => warn!("The host isn't reading the composite interface; report dropped"),
+        }
         Ok(n)
     }
 }
@@ -195,6 +211,12 @@ impl<'d, D: Driver<'d>> HidWriterTrait for UsbKeyboardWriter<'_, 'd, D> {
 
 /// bRequest value Windows sends to fetch the MS OS 2.0 descriptor set.
 pub(crate) const MSOS_VENDOR_CODE: u8 = 0x52;
+
+/// How long a mouse, media or system report waits for the host to take the one
+/// before it. A host that reads only the boot keyboard interface (a BIOS, UEFI,
+/// a KVM) never does, and the keyboard reports queued behind it must not wait
+/// with it. The interface is polled every 1 ms, so a reading host is never close.
+const COMPOSITE_WRITE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(50);
 
 /// Report id byte plus the largest composite payload, which is the mouse report.
 const COMPOSITE_WRITE_SIZE: usize = 1 + MOUSE_REPORT_SIZE;
@@ -494,7 +516,9 @@ impl<D: Driver<'static>, S: HostSession> Runnable for UsbTransport<'_, D, S> {
             loop {
                 device.run_until_suspend().await;
                 match select(device.wait_resume(), USB_REMOTE_WAKEUP.wait()).await {
-                    Either::First(_) => continue,
+                    // A wakeup asked for as the host resumed on its own is served:
+                    // left set, it would wake the host the moment it next sleeps.
+                    Either::First(_) => USB_REMOTE_WAKEUP.reset(),
                     Either::Second(_) => {
                         info!("USB remote wakeup requested");
                         if let Err(e) = device.remote_wakeup().await {
@@ -784,6 +808,10 @@ impl Handler for UsbDeviceHandler {
 // `cargo test` is rejected at startup by `test_support::require_nextest`).
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
+    use std::rc::Rc;
+
     use embassy_usb::Handler;
     use embassy_usb::class::hid::RequestHandler;
     use rmk_types::connection::UsbState;
@@ -905,5 +933,270 @@ mod tests {
         handler.suspended(true);
         handler.suspended(false);
         assert_eq!(current_usb_state(), UsbState::Configured);
+    }
+
+    /// A stand-in USB part for the report writer: only IN endpoints, each with
+    /// a one-packet FIFO the test empties or not.
+    mod part {
+        extern crate std;
+
+        use core::cell::{Cell, RefCell};
+        use core::task::Poll;
+        use std::rc::Rc;
+        use std::vec::Vec;
+
+        use embassy_time::Instant;
+        use embassy_usb::driver::{
+            Bus, ControlPipe, Driver, Endpoint, EndpointAddress, EndpointAllocError, EndpointError, EndpointIn,
+            EndpointInfo, EndpointOut, EndpointType, Event, Unsupported,
+        };
+
+        #[derive(Default)]
+        pub(super) struct EpState {
+            pub disabled: Cell<bool>,
+            /// The host leaves the FIFO full: the next write waits for good.
+            pub host_away: Cell<bool>,
+            full: Cell<bool>,
+            pub sent: RefCell<Vec<(Instant, Vec<u8>)>>,
+        }
+
+        /// Clones share the endpoints handed out.
+        #[derive(Clone, Default)]
+        pub(super) struct Part {
+            pub eps: Rc<RefCell<Vec<Rc<EpState>>>>,
+        }
+
+        pub(super) struct In {
+            info: EndpointInfo,
+            state: Rc<EpState>,
+        }
+
+        impl Endpoint for In {
+            fn info(&self) -> &EndpointInfo {
+                &self.info
+            }
+
+            async fn wait_enabled(&mut self) {
+                core::future::poll_fn(|_| match self.state.disabled.get() {
+                    true => Poll::Pending,
+                    false => Poll::Ready(()),
+                })
+                .await
+            }
+        }
+
+        impl EndpointIn for In {
+            async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+                core::future::poll_fn(|_| {
+                    if self.state.disabled.get() {
+                        return Poll::Ready(Err(EndpointError::Disabled));
+                    }
+                    if self.state.full.get() && self.state.host_away.get() {
+                        return Poll::Pending;
+                    }
+                    self.state.full.set(self.state.host_away.get());
+                    self.state.sent.borrow_mut().push((Instant::now(), buf.to_vec()));
+                    Poll::Ready(Ok(()))
+                })
+                .await
+            }
+        }
+
+        pub(super) struct Unused;
+
+        impl Endpoint for Unused {
+            fn info(&self) -> &EndpointInfo {
+                unimplemented!()
+            }
+            async fn wait_enabled(&mut self) {}
+        }
+
+        impl EndpointOut for Unused {
+            async fn read(&mut self, _: &mut [u8]) -> Result<usize, EndpointError> {
+                unimplemented!()
+            }
+        }
+
+        impl ControlPipe for Unused {
+            fn max_packet_size(&self) -> usize {
+                64
+            }
+            async fn setup(&mut self) -> [u8; 8] {
+                unimplemented!()
+            }
+            async fn data_out(&mut self, _: &mut [u8], _: bool, _: bool) -> Result<usize, EndpointError> {
+                unimplemented!()
+            }
+            async fn data_in(&mut self, _: &[u8], _: bool, _: bool) -> Result<(), EndpointError> {
+                unimplemented!()
+            }
+            async fn accept(&mut self) {}
+            async fn reject(&mut self) {}
+            async fn accept_set_address(&mut self, _: u8) {}
+        }
+
+        impl Bus for Unused {
+            async fn enable(&mut self) {}
+            async fn disable(&mut self) {}
+            async fn poll(&mut self) -> Event {
+                core::future::pending().await
+            }
+            fn endpoint_set_enabled(&mut self, _: EndpointAddress, _: bool) {}
+            fn endpoint_set_stalled(&mut self, _: EndpointAddress, _: bool) {}
+            fn endpoint_is_stalled(&mut self, _: EndpointAddress) -> bool {
+                false
+            }
+            async fn remote_wakeup(&mut self) -> Result<(), Unsupported> {
+                Err(Unsupported)
+            }
+        }
+
+        impl<'a> Driver<'a> for Part {
+            type EndpointOut = Unused;
+            type EndpointIn = In;
+            type ControlPipe = Unused;
+            type Bus = Unused;
+
+            fn alloc_endpoint_out(
+                &mut self,
+                _: EndpointType,
+                _: Option<EndpointAddress>,
+                _: u16,
+                _: u8,
+            ) -> Result<Unused, EndpointAllocError> {
+                Err(EndpointAllocError)
+            }
+
+            fn alloc_endpoint_in(
+                &mut self,
+                ep_type: EndpointType,
+                _: Option<EndpointAddress>,
+                max_packet_size: u16,
+                interval_ms: u8,
+            ) -> Result<In, EndpointAllocError> {
+                let state = Rc::new(EpState::default());
+                self.eps.borrow_mut().push(state.clone());
+                let info = EndpointInfo {
+                    addr: EndpointAddress::from_parts(self.eps.borrow().len(), embassy_usb::driver::Direction::In),
+                    ep_type,
+                    max_packet_size,
+                    interval_ms,
+                };
+                Ok(In { info, state })
+            }
+
+            fn start(self, _: u16) -> (Unused, Unused) {
+                (Unused, Unused)
+            }
+        }
+    }
+
+    /// Run the report writer over a fresh part for `ms` of virtual time, with
+    /// `reports` queued and `setup` applied to the keyboard and composite
+    /// endpoints first; `during` runs alongside it with the keyboard endpoint.
+    fn run_writer<F: core::future::Future<Output = ()>>(
+        reports: &[crate::hid::Report],
+        setup: impl FnOnce(&part::EpState, &part::EpState),
+        during: impl FnOnce(Rc<part::EpState>) -> F,
+        ms: u64,
+    ) -> (Rc<part::EpState>, Rc<part::EpState>) {
+        use embassy_usb::class::hid::{Config, HidBootProtocol, HidSubclass, HidWriter, State};
+
+        use super::{COMPOSITE_WRITE_SIZE, UsbKeyboardWriter};
+        use crate::channel::USB_REPORT_CHANNEL;
+
+        let part = part::Part::default();
+        let bufs = std::boxed::Box::leak(std::boxed::Box::new([[0u8; 256]; 4]));
+        let [config, bos, msos, control] = bufs;
+        let mut builder =
+            embassy_usb::Builder::new(part.clone(), embassy_usb::Config::new(0, 0), config, bos, msos, control);
+        let config = || Config {
+            report_descriptor: &[],
+            request_handler: None,
+            poll_ms: 1,
+            max_packet_size: 8,
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
+        };
+        let states = std::boxed::Box::leak(std::boxed::Box::new([State::new(), State::new(), State::new()]));
+        let [keyboard_state, other_state, _steno_state] = states;
+        let mut keyboard_writer = HidWriter::<_, 8>::new(&mut builder, keyboard_state, config());
+        let mut other_writer = HidWriter::<_, COMPOSITE_WRITE_SIZE>::new(&mut builder, other_state, config());
+        #[cfg(feature = "steno")]
+        let mut steno_writer = HidWriter::<_, 9>::new(&mut builder, _steno_state, config());
+        drop(builder);
+        let (keyboard, other) = (part.eps.borrow()[0].clone(), part.eps.borrow()[1].clone());
+        setup(&keyboard, &other);
+
+        USB_REPORT_CHANNEL.clear();
+        for report in reports {
+            USB_REPORT_CHANNEL.try_send(report.clone()).unwrap();
+        }
+        set_usb_state(UsbState::Configured);
+        let mut writer = UsbKeyboardWriter {
+            keyboard_writer: &mut keyboard_writer,
+            other_writer: &mut other_writer,
+            #[cfg(feature = "steno")]
+            steno_writer: &mut steno_writer,
+        };
+        crate::test_support::test_block_on(async {
+            embassy_futures::select::select3(
+                writer.run_writer(),
+                during(keyboard.clone()),
+                embassy_time::Timer::after_millis(ms),
+            )
+            .await;
+        });
+        (keyboard, other)
+    }
+
+    fn key(code: u8) -> crate::hid::Report {
+        crate::hid::Report::KeyboardReport(crate::hid::KeyboardReport {
+            keycodes: [code, 0, 0, 0, 0, 0],
+            ..Default::default()
+        })
+    }
+
+    fn media(usage_id: u16) -> crate::hid::Report {
+        crate::hid::Report::MediaKeyboardReport(usbd_hid::descriptor::MediaKeyboardReport { usage_id })
+    }
+
+    /// A host that reads only the boot keyboard (a BIOS, a KVM) never takes a
+    /// media report: the second one must not hold up the keys behind it.
+    #[test]
+    fn an_unread_composite_interface_does_not_stall_the_keys() {
+        let (keyboard, _) = run_writer(
+            &[media(0xE9), media(0), key(4)],
+            |_, other| other.host_away.set(true),
+            |_| core::future::pending(),
+            1_000,
+        );
+        assert_eq!(keyboard.sent.borrow().len(), 1, "the key report went out");
+    }
+
+    /// After a bus reset the endpoints are disabled until the host configures
+    /// the device again: the report waits for that, not a fixed half second,
+    /// and asks for no wakeup from a host that isn't asleep.
+    #[test]
+    fn a_report_after_a_bus_reset_goes_out_once_the_host_configures() {
+        let start = embassy_time::Instant::now();
+        let (keyboard, _) = run_writer(
+            &[key(0), key(4)],
+            |keyboard, _| keyboard.disabled.set(true),
+            |keyboard| async move {
+                embassy_time::Timer::after_millis(20).await;
+                keyboard.disabled.set(false);
+                core::future::pending().await
+            },
+            1_000,
+        );
+        let sent = keyboard.sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert!(
+            sent[1].0 - start < embassy_time::Duration::from_millis(100),
+            "{:?}",
+            sent[1].0 - start
+        );
+        assert!(!super::USB_REMOTE_WAKEUP.signaled());
     }
 }
