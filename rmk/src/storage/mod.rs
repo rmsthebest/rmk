@@ -93,8 +93,9 @@ pub(crate) fn read(key: StorageKey) -> impl Future<Output = Result<Option<Storag
     request(FlashOperationMessage::Read(key))
 }
 
-/// Erase everything and reboot. Fire and forget.
-pub(crate) fn reset() -> impl Future<Output = ()> {
+/// Erase everything and reboot, as ClearEeprom's release does. Fire and
+/// forget.
+pub fn reset() -> impl Future<Output = ()> {
     FLASH_CHANNEL.send((FlashOperationMessage::Reset, None))
 }
 
