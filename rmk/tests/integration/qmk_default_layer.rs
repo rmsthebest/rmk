@@ -34,3 +34,30 @@ fn a_default_layer_release_keeps_a_layer_held_since() {
         set_qmk_default_layer(false);
     });
 }
+
+/// As QMK boards do it (layer_move(0) only on a mismatch), a default-layer
+/// key for the default already set leaves a held layer on.
+#[test]
+fn the_current_default_layer_again_keeps_a_held_layer() {
+    test_block_on(async {
+        set_qmk_default_layer(true);
+        let mut keyboard = SimKeyboard::builder([
+            [[df!(0), mo!(2), k!(A)]],
+            [[df!(0), mo!(2), k!(B)]],
+            [[df!(0), a!(Transparent), k!(C)]],
+        ])
+        .build()
+        .await;
+        keyboard
+            .press(0, 1)
+            .press(0, 0)
+            .release(0, 0)
+            .press(0, 2)
+            .expect_keys([HidKeyCode::C])
+            .release(0, 2)
+            .expect_keys([])
+            .release(0, 1);
+        keyboard.run().await;
+        set_qmk_default_layer(false);
+    });
+}

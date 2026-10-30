@@ -208,7 +208,8 @@ static QMK_DEFAULT_LAYER: AtomicBool = AtomicBool::new(false);
 /// Follows QMK's default-layer rules: a key transparent down to the default
 /// layer takes layer 0's action (QMK's layer_switch_get_layer falls back to
 /// 0), and a new default layer turns the other layers off (layer_move(0) after
-/// set_single_persistent_default_layer, as QMK boards with a Win/Mac switch do).
+/// set_single_persistent_default_layer, as QMK boards with a Win/Mac switch do,
+/// only when the default changes).
 pub fn set_qmk_default_layer(on: bool) {
     QMK_DEFAULT_LAYER.store(on, Ordering::Relaxed);
 }
@@ -231,7 +232,7 @@ impl KeyMapInner<'_> {
             return;
         }
         let before = self.get_activated_layer();
-        if QMK_DEFAULT_LAYER.load(Ordering::Relaxed) {
+        if QMK_DEFAULT_LAYER.load(Ordering::Relaxed) && layer_num != self.behavior.default_layer {
             self.layer_state.fill(false);
         }
         self.behavior.default_layer = layer_num;
