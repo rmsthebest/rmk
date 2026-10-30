@@ -276,7 +276,8 @@ impl KeyMapInner<'_> {
         }
     }
 
-    /// Returns whether the slot exists and now holds a different action.
+    /// Returns whether the slot exists. Writing a slot's own action again
+    /// counts too: a save that failed can then be retried.
     fn set_action_at(&mut self, source: KeyboardEventSource, layer_num: usize, action: KeyAction) -> bool {
         let slot = match source {
             KeyboardEventSource::Key(key_pos) => {
@@ -305,7 +306,8 @@ impl KeyMapInner<'_> {
             | KeyboardEventSource::Virtual(_)
             | KeyboardEventSource::KeyCode(_) => return false,
         };
-        core::mem::replace(slot, action) != action
+        *slot = action;
+        true
     }
 
     fn get_action_with_layer_cache(&mut self, event: KeyboardEvent) -> KeyAction {
@@ -598,7 +600,7 @@ impl<'a> KeyMap<'a> {
         self.inner.borrow().get_activated_layer()
     }
 
-    /// Returns whether the slot exists and now holds a different action.
+    /// Returns whether the slot exists.
     pub(crate) fn set_action_at(&self, source: KeyboardEventSource, layer: usize, action: KeyAction) -> bool {
         self.inner.borrow_mut().set_action_at(source, layer, action)
     }
@@ -862,15 +864,16 @@ impl<'a> KeyMap<'a> {
     }
 
     /// Write one direction of an encoder. Returns the updated pair, or `None`
-    /// if the slot is out of range or already held `action`.
+    /// if the slot is out of range.
     pub(crate) fn set_encoder_clockwise(&self, layer: usize, id: usize, action: KeyAction) -> Option<EncoderAction> {
         let mut inner = self.inner.borrow_mut();
         let slot = inner.encoder_mut(layer, id)?;
-        (core::mem::replace(&mut slot.clockwise, action) != action).then_some(*slot)
+        slot.clockwise = action;
+        Some(*slot)
     }
 
     /// Write one direction of an encoder. Returns the updated pair, or `None`
-    /// if the slot is out of range or already held `action`.
+    /// if the slot is out of range.
     pub(crate) fn set_encoder_counter_clockwise(
         &self,
         layer: usize,
@@ -879,14 +882,18 @@ impl<'a> KeyMap<'a> {
     ) -> Option<EncoderAction> {
         let mut inner = self.inner.borrow_mut();
         let slot = inner.encoder_mut(layer, id)?;
-        (core::mem::replace(&mut slot.counter_clockwise, action) != action).then_some(*slot)
+        slot.counter_clockwise = action;
+        Some(*slot)
     }
 
     /// Write both directions of an encoder under one borrow. Returns `false`
-    /// if the slot is out of range or already held `action`.
+    /// if the slot is out of range.
     pub(crate) fn set_encoder(&self, layer: usize, id: usize, action: EncoderAction) -> bool {
         match self.inner.borrow_mut().encoder_mut(layer, id) {
-            Some(slot) => core::mem::replace(slot, action) != action,
+            Some(slot) => {
+                *slot = action;
+                true
+            }
             None => false,
         }
     }
