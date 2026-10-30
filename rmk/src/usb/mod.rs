@@ -157,11 +157,10 @@ impl<'d, D: Driver<'d>> UsbKeyboardWriter<'_, 'd, D> {
         if BOOT_MODE.load(Ordering::Relaxed) {
             return Ok(n);
         }
-        match embassy_time::with_timeout(COMPOSITE_WRITE_TIMEOUT, self.other_writer.write(&buf[0..n + 1])).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(HidError::UsbEndpointError(e)),
-            Err(_) => warn!("The host isn't reading the composite interface; report dropped"),
-        }
+        self.other_writer
+            .write(&buf[0..n + 1])
+            .await
+            .map_err(HidError::UsbEndpointError)?;
         Ok(n)
     }
 }
@@ -215,12 +214,6 @@ impl<'d, D: Driver<'d>> HidWriterTrait for UsbKeyboardWriter<'_, 'd, D> {
 
 /// bRequest value Windows sends to fetch the MS OS 2.0 descriptor set.
 pub(crate) const MSOS_VENDOR_CODE: u8 = 0x52;
-
-/// How long a mouse, media or system report waits for the host to take the one
-/// before it. A host that reads only the boot keyboard interface (a BIOS, UEFI,
-/// a KVM) never does, and the keyboard reports queued behind it must not wait
-/// with it. The interface is polled every 1 ms, so a reading host is never close.
-const COMPOSITE_WRITE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(50);
 
 /// Report id byte plus the largest composite payload, which is the mouse report.
 const COMPOSITE_WRITE_SIZE: usize = 1 + MOUSE_REPORT_SIZE;
@@ -1226,13 +1219,16 @@ mod tests {
         crate::hid::Report::MediaKeyboardReport(usbd_hid::descriptor::MediaKeyboardReport { usage_id })
     }
 
-    /// A host that reads only the boot keyboard (a BIOS, a KVM) never takes a
+    /// A boot protocol host (a BIOS, a KVM) reads only the boot keyboard, never a
     /// media report: the second one must not hold up the keys behind it.
     #[test]
     fn an_unread_composite_interface_does_not_stall_the_keys() {
         let (keyboard, _) = run_writer(
             &[media(0xE9), media(0), key(4)],
-            |_, other| other.host_away.set(true),
+            |_, other| {
+                other.host_away.set(true);
+                super::BOOT_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
+            },
             |_| core::future::pending(),
             1_000,
         );
