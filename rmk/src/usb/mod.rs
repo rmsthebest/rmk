@@ -116,15 +116,13 @@ impl<'d, D: Driver<'d>> UsbKeyboardWriter<'_, 'd, D> {
                 // OTG peripherals disable the endpoints in suspend, so there
                 // Disabled asks for a wakeup. Otherwise a bus reset disabled
                 // them until the host configures the device again. Either way
-                // the report goes once the endpoint is back.
+                // the next report waits for the endpoint, and this one is
+                // dropped: a host that reset holds no keys down.
                 if let HidError::UsbEndpointError(EndpointError::Disabled) = e {
                     if current_usb_state() == UsbState::Suspended {
                         USB_REMOTE_WAKEUP.signal(());
                     }
                     self.wait_enabled(&report).await;
-                    if let Err(e) = self.write_report(&report).await {
-                        error!("Failed to send report after wakeup: {:?}", e);
-                    }
                 }
             }
         }
@@ -1236,8 +1234,9 @@ mod tests {
     }
 
     /// After a bus reset the endpoints are disabled until the host configures
-    /// the device again: the report waits for that, not a fixed half second,
-    /// and asks for no wakeup from a host that isn't asleep.
+    /// the device again: the report that failed is dropped, not sent late, the
+    /// next waits for the host, not a fixed half second, and no wakeup is asked
+    /// of a host that isn't asleep.
     #[test]
     fn a_report_after_a_bus_reset_goes_out_once_the_host_configures() {
         let start = embassy_time::Instant::now();
@@ -1252,11 +1251,12 @@ mod tests {
             1_000,
         );
         let sent = keyboard.sent.borrow();
-        assert_eq!(sent.len(), 2);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1[2], 4, "the report after the failed one");
         assert!(
-            sent[1].0 - start < embassy_time::Duration::from_millis(100),
+            sent[0].0 - start < embassy_time::Duration::from_millis(100),
             "{:?}",
-            sent[1].0 - start
+            sent[0].0 - start
         );
         assert!(!super::USB_REMOTE_WAKEUP.signaled());
     }
