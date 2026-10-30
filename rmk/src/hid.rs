@@ -571,9 +571,10 @@ pub(crate) async fn run_led_reader<R: HidReaderTrait<ReportType = LedIndicator>>
     loop {
         match reader.read_report().await {
             Ok(led_indicator) => apply_led_report(led_indicator, kind),
-            // A reader that can't read waits inside `read_report` for the
-            // transport to come back, so the next report isn't held up.
-            Err(e) => debug!("Read HID LED indicator error: {:?}", e),
+            Err(e) => {
+                debug!("Read HID LED indicator error: {:?}", e);
+                embassy_time::Timer::after_millis(1000).await;
+            }
         }
     }
 }
