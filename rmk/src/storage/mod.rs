@@ -1,5 +1,7 @@
 use core::fmt::Debug;
 use core::future::{Future, poll_fn};
+use core::mem::MaybeUninit;
+use core::ops::Range;
 
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_sync::channel::{Channel, TrySendError};
@@ -368,12 +370,10 @@ pub(crate) const SCHEMA_HASH: u32 = {
     hash
 };
 
+type StorageCache = Cache<CalculatedPageStates, ArrayPagePointers<32>, ArrayKeyPointers<StorageKey, 32>, StorageKey>;
+
 pub struct Storage<F: AsyncNorFlash> {
-    pub(crate) flash: MapStorage<
-        StorageKey,
-        F,
-        Cache<CalculatedPageStates, ArrayPagePointers<32>, ArrayKeyPointers<StorageKey, 32>, StorageKey>,
-    >,
+    pub(crate) flash: MapStorage<StorageKey, F, StorageCache>,
     pub(crate) buffer: [u8; BUFFER_SIZE],
     #[cfg(feature = "host")]
     pub(crate) clear_layout: bool,
@@ -411,6 +411,23 @@ impl<F: AsyncNorFlash> Storage<F> {
     }
 
     pub async fn new(flash: F, storage_config: &StorageConfig) -> Self {
+        let mut slot = MaybeUninit::uninit();
+        Self::new_in(&mut slot, flash, storage_config).await;
+        // SAFETY: `new_in` writes `slot` (in `open_in`) on every path that returns: before its
+        // first await, with no return before it. A panic before that write never gets here, and
+        // if this future is dropped partway, `assume_init` never runs: the storage in `slot` is
+        // leaked, not read or dropped twice.
+        unsafe { slot.assume_init() }
+    }
+
+    /// [`Self::new`], built in `slot`. The storage is about 0.8 KB: returned by value, it is
+    /// copied through the stack of every poll that builds it (several times over), which on a
+    /// small MCU can be the stack's deepest point. Here only the out-of-line helpers that fill
+    /// `slot` hold it, and they return before the first flash read.
+    ///
+    /// `slot` is initialized once this returns (and from its first await on). `MaybeUninit`
+    /// never drops what it holds: that's up to the caller, for a slot that isn't `'static`.
+    pub async fn new_in<'s>(slot: &'s mut MaybeUninit<Self>, flash: F, storage_config: &StorageConfig) -> &'s mut Self {
         assert!(
             storage_config.num_sectors >= 2,
             "Number of used sector for storage must larger than 1"
@@ -444,19 +461,8 @@ impl<F: AsyncNorFlash> Storage<F> {
             storage_range.start,
         );
 
-        let cache = || {
-            Cache::new(
-                CalculatedPageStates::new(storage_config.num_sectors as usize),
-                ArrayPagePointers::new(),
-                ArrayKeyPointers::new(),
-            )
-        };
-        let mut storage = Self {
-            flash: MapStorage::new(flash, MapConfig::new(storage_range.clone()), cache()),
-            buffer: [0; BUFFER_SIZE],
-            #[cfg(feature = "host")]
-            clear_layout: false,
-        };
+        let num_sectors = storage_config.num_sectors as usize;
+        let storage = Self::open_in(slot, flash, storage_range.clone(), num_sectors);
 
         let erase = match storage.fetch_retrying(StorageKey::StorageConfig).await {
             Ok(Some(StorageValue::StorageConfig(schema_hash))) => schema_hash != SCHEMA_HASH,
@@ -476,11 +482,14 @@ impl<F: AsyncNorFlash> Storage<F> {
         };
         if storage_config.clear_storage || erase {
             debug!("Clearing storage!");
+            let _ = storage
+                .flash
+                .flash()
+                .erase(storage_range.start, storage_range.end)
+                .await;
             // An erase never invalidates the cache the probing `fetch` filled, so rebuild the map
             // with a fresh one. Nothing else is written back: reads now miss and the RAM defaults stand.
-            let (mut raw, _) = storage.flash.destroy();
-            let _ = raw.erase(storage_range.start, storage_range.end).await;
-            storage.flash = MapStorage::new(raw, MapConfig::new(storage_range), cache());
+            storage.reopen(storage_range, num_sectors);
             let _ = storage.put(StorageItem::StorageConfig(SCHEMA_HASH)).await;
             // The erase already handed the compiled-in layout the win: reads miss and the RAM
             // defaults stand, so there is nothing for `clear_layout` to overwrite.
@@ -492,6 +501,52 @@ impl<F: AsyncNorFlash> Storage<F> {
         }
 
         storage
+    }
+
+    fn cache(num_sectors: usize) -> StorageCache {
+        Cache::new(
+            CalculatedPageStates::new(num_sectors),
+            ArrayPagePointers::new(),
+            ArrayKeyPointers::new(),
+        )
+    }
+
+    /// The storage over `range`, with an empty cache, in `slot`.
+    #[inline(never)]
+    fn open_in(slot: &mut MaybeUninit<Self>, flash: F, range: Range<u32>, num_sectors: usize) -> &mut Self {
+        slot.write(Self {
+            flash: MapStorage::new(flash, MapConfig::new(range), Self::cache(num_sectors)),
+            buffer: [0; BUFFER_SIZE],
+            #[cfg(feature = "host")]
+            clear_layout: false,
+        })
+    }
+
+    /// The map rebuilt in place over the same flash, with an empty cache.
+    #[inline(never)]
+    fn reopen(&mut self, range: Range<u32>, num_sectors: usize) {
+        // sequential-storage keeps its cache reset private, so the map is rebuilt: the flash is
+        // taken out of the old map (`destroy` consumes it) and given to a new one. Done in place,
+        // with `&mut self`, that's a move out of `self.flash` and back. Everything that can panic
+        // (MapConfig::new asserts the range) comes first.
+        let config = MapConfig::new(range);
+        let cache = Self::cache(num_sectors);
+        // SAFETY: from the `ptr::read` to the `ptr::write`, `self.flash` holds a value that has
+        // been moved out, and must not be used or dropped:
+        // - nothing else can see it: `&mut self` is the only reference to `self`;
+        // - nothing in between can unwind, which would drop `self` with it: `destroy` and
+        //   `MapStorage::new` only move fields into and out of structs (sequential-storage
+        //   8.0.2: `GenericStorage::destroy` is `(self.flash, self.cache)`, `MapStorage::new` a
+        //   struct literal), and the old cache is dropped only after the write;
+        // - `ptr::write` doesn't drop the moved-out value it overwrites.
+        // Each value is moved once, as a safe move would: `raw` is the flash `self` owned, now in
+        // the new map, and nothing is dropped twice or left behind.
+        let old_cache = unsafe {
+            let (raw, old_cache) = core::ptr::read(&self.flash).destroy();
+            core::ptr::write(&mut self.flash, MapStorage::new(raw, config, cache));
+            old_cache
+        };
+        drop(old_cache);
     }
 
     /// Overwrite every item the layout owns with the compiled-in defaults, so a value a host
