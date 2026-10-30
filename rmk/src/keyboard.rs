@@ -1590,8 +1590,6 @@ impl<'a> Keyboard<'a> {
         }
     }
 
-    /// The key a Repeat or Again `event` stands for: the last key on its press,
-    /// and on its release whatever that press repeated.
     /// Runs the action hook on `action`. A release still goes through the hook,
     /// but ends what its press became.
     fn run_action_hook(
@@ -1621,6 +1619,8 @@ impl<'a> Keyboard<'a> {
         pass
     }
 
+    /// The key a Repeat or Again `event` stands for: the last key on its press,
+    /// and on its release whatever that press repeated.
     fn repeated_key(&mut self, event: KeyboardEvent) -> HidKeyCode {
         if event.pressed {
             if self.repeated_keys.push((event.source, self.last_key_code)).is_err() {
